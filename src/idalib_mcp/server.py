@@ -53,8 +53,6 @@ class OpenSubmission:
 
 
 def _build_managed_supervisor_class(upstream):
-    seat_phases = ("spawning", "opening", "registering")
-
     def reason_text(exc: BaseException) -> str:
         try:
             return str(exc) or type(exc).__name__
@@ -123,7 +121,9 @@ def _build_managed_supervisor_class(upstream):
         def _pinned_session(self) -> str | None:
             return getattr(self._job_local, "session_id", None)
 
-        def _wrap_job_body(self, body: Callable[[Job], Any], ensure_ready: bool) -> Callable[[Job], Any]:
+        def _wrap_job_body(
+            self, body: Callable[[Job], Any], ensure_ready: bool, dispatcher: WorkerDispatcher
+        ) -> Callable[[Job], Any]:
             """Return the executor-side job wrapper; call it on the submitting thread."""
             transport_session_id = getattr(self.mcp._transport_session_id, "data", None)
             extensions = getattr(self.mcp._enabled_extensions, "data", None)
@@ -136,7 +136,7 @@ def _build_managed_supervisor_class(upstream):
                     local.session_id = job.session_id
                     mcp._transport_session_id.data = transport_session_id
                     mcp._enabled_extensions.data = set() if extensions is None else set(extensions)
-                    supervisor._guard_follower(job)
+                    supervisor._guard_follower(job, dispatcher)
                     if ensure_ready:
                         supervisor._ensure_ready(job)
                     if job.cancel_requested:
@@ -149,12 +149,18 @@ def _build_managed_supervisor_class(upstream):
 
             return run
 
-        def _guard_follower(self, job: Job) -> None:
+        def _guard_follower(self, job: Job, dispatcher: WorkerDispatcher) -> None:
+            sid = job.session_id
+            cancelled = f"Database '{sid}' did not open: Cancelled"
             with self._lock:
-                record = self._pending.get(job.session_id)
-                if record is None or record.job is job:
+                record = self._pending.get(sid)
+                if record is not None:
+                    if record.job is job:
+                        return
+                    raise QueueClosedError(cancelled)
+                if job.kind == "open" or sid in self.sessions:
                     return
-            raise QueueClosedError(f"Database '{job.session_id}' did not open: Cancelled")
+            raise QueueClosedError(dispatcher.close_reason or cancelled)
 
         def _ensure_ready(self, job: Job) -> None:
             with self._lock:
@@ -186,7 +192,7 @@ def _build_managed_supervisor_class(upstream):
                     raise TypeError("body must be callable")
                 if ensure_ready is None:
                     ensure_ready = kind != "close"
-                wrapped = self._wrap_job_body(body, ensure_ready)
+                wrapped = self._wrap_job_body(body, ensure_ready, dispatcher)
                 return dispatcher.submit(tool, json_rpc_id, args, wrapped, kind=kind)
 
         # --- opening and seats ----------------------------------------------
@@ -289,7 +295,7 @@ def _build_managed_supervisor_class(upstream):
                 "discard": False,
             }
             phases = self._wrap_job_body(
-                lambda job: self._run_open(record, job, run_auto_analysis, outcome), True
+                lambda job: self._run_open(record, job, run_auto_analysis, outcome), True, record.dispatcher
             )
 
             def run(job: Job) -> Any:
@@ -494,7 +500,12 @@ def _build_managed_supervisor_class(upstream):
                     for session in self.sessions.values()
                     if session.backend == "worker" and session.owned and session.is_alive()
                 )
-                count += sum(1 for record in self._pending.values() if record.phase in seat_phases)
+                count += sum(
+                    1
+                    for record in self._pending.values()
+                    if record.phase in ("spawning", "opening")
+                    or (record.phase == "registering" and record.worker is not None)
+                )
                 count += len(self._reopens)
                 schema = self._schema_worker
                 if schema is not None and schema.is_alive():
@@ -528,6 +539,7 @@ def _build_managed_supervisor_class(upstream):
                             result = current
                         else:
                             self._schema_worker = spawned
+                            self._schema_spawning = False
                             result = spawned
                     if result is not spawned:
                         self._dispose_worker(spawned)
@@ -610,12 +622,12 @@ def _build_managed_supervisor_class(upstream):
                     pid=worker.process.pid if worker.process is not None else None,
                 )
                 with self._lock:
-                    if self._reopens.get(sid) is mark:
-                        del self._reopens[sid]
                     if self._shut_down:
                         raise RuntimeError("Supervisor shutting down")
                     current = self.sessions.get(sid)
                     if current is session:
+                        if self._reopens.get(sid) is mark:
+                            del self._reopens[sid]
                         self._register_session_locked(replacement, resolved, None)
                         settled = True
                         return replacement
@@ -710,7 +722,7 @@ def _build_managed_supervisor_class(upstream):
                     raise RuntimeError(f"Session is stale or missing: {target}")
                 return direct(session, payload, timeout=timeout)
 
-            wrapped = self._wrap_job_body(send, True)
+            wrapped = self._wrap_job_body(send, True, dispatcher)
             return dispatcher.run(
                 label,
                 payload.get("id"),

@@ -8,6 +8,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from fakeworker import FakeWorker, FakeWorkerFactory, make_supervisor, preserved_upstream
 from idalib_mcp.dispatcher import QueueClosedError, WorkerDispatcher
@@ -709,7 +710,12 @@ class SupervisorOpenPipelineTests(unittest.TestCase):
         self.assertEqual(supervisor.database_state(sid), "reopening")
         self.assertEqual(job.info()["phase"], "reopening")
         self.assertEqual(supervisor.seats_in_use(), 1)
-        self.assertEqual(supervisor.list_sessions(None)[0]["metadata"]["state"], "reopening")
+        listed: list[Any] = []
+        lister = threading.Thread(target=lambda: listed.append(supervisor.list_sessions(None)), daemon=True)
+        lister.start()
+        lister.join(1.0)
+        self.assertFalse(lister.is_alive())
+        self.assertEqual(listed[0][0]["metadata"]["state"], "reopening")
 
         gate.set()
         self.assertTrue(job.wait(_WAIT))
@@ -948,6 +954,125 @@ class SupervisorOpenPipelineTests(unittest.TestCase):
             tracked = {handed_back.port, *registered}
             self.assertTrue(all(worker.port in tracked for worker in alive))
             self.assertIn("echo", [tool["name"] for tool in responses[0]["result"]["tools"]])
+
+    def test_gui_match_registering_takes_no_seat(self) -> None:
+        supervisor, factory = self._make(max_workers=1)
+        gui_path = self._path("gui.exe")
+        instance = {"host": "127.0.0.1", "port": _closed_port(), "pid": 4242, "idb_path": gui_path}
+        supervisor._find_gui_instance_for_path = lambda resolved_path: (
+            instance if resolved_path == gui_path else None
+        )
+        register = supervisor._register_open
+        entered = threading.Event()
+        hold = self._held_gate()
+
+        def paused_register(record: Any, job: Any, session: Any, outcome: Any) -> Any:
+            if session.backend == "gui":
+                entered.set()
+                hold.wait(_WAIT)
+            return register(record, job, session, outcome)
+
+        supervisor._register_open = paused_register
+        gui = supervisor.submit_open(gui_path, context_id=self.ctx)
+        self.assertTrue(entered.wait(_WAIT))
+        self.assertEqual(gui.job.info()["phase"], "registering")
+        self.assertEqual(supervisor.seats_in_use(), 0)
+
+        other = supervisor.submit_open(self._path("b.exe"), context_id="ctx-b")
+        self.assertTrue(other.job.wait(_WAIT))
+        self.assertEqual(other.job.status, "ok")
+
+        hold.set()
+        self.assertTrue(gui.job.wait(_WAIT))
+        self.assertEqual(gui.job.status, "ok")
+        self.assertEqual(supervisor.sessions[gui.session_id].backend, "gui")
+        self.assertEqual((len(factory.workers), supervisor.seats_in_use()), (1, 1))
+
+    def test_reopen_collision_keeps_seat_until_discarded(self) -> None:
+        gate = threading.Event()
+        supervisor, factory = self._make(spawn_gate=gate)
+        self.addCleanup(gate.set)
+        path = self._path("gui.exe")
+        instance = {"host": "127.0.0.1", "port": _closed_port(), "pid": 4242, "idb_path": path}
+        supervisor._find_gui_instance_for_path = lambda resolved_path: instance
+        opened = supervisor.submit_open(path, context_id=self.ctx)
+        self.assertTrue(opened.job.wait(_WAIT))
+        sid = opened.session_id
+        discard = supervisor._discard_opened_worker_session
+        discarding = threading.Event()
+        hold = self._held_gate()
+
+        def blocked_discard(worker: Any, session_id: str) -> None:
+            discarding.set()
+            hold.wait(_WAIT)
+            discard(worker, session_id)
+
+        supervisor._discard_opened_worker_session = blocked_discard
+        job = supervisor.submit_job(sid, "echo", 1, {}, lambda _job: "never")
+        self.assertTrue(_wait_until(lambda: len(factory.spawn_threads) == 1))
+        with supervisor._lock:
+            supervisor._unregister_session_locked(sid)
+        gate.set()
+        self.assertTrue(discarding.wait(_WAIT))
+        worker = factory.workers[0]
+        self.assertIsNone(worker.process.poll())
+        self.assertEqual(supervisor.seats_in_use(), 1)
+
+        with self.assertLogs("idalib_mcp.dispatcher", level="ERROR"):
+            hold.set()
+            self.assertTrue(job.wait(_WAIT))
+        expected = f"Session '{sid}' was closed or replaced while reopening headlessly"
+        self.assertEqual((job.status, job.info()["error"]), ("error", expected))
+        self.assertEqual(worker.process.poll(), -9)
+        self.assertEqual(supervisor.seats_in_use(), 0)
+
+    def test_follower_after_removed_open_never_runs_body(self) -> None:
+        supervisor, factory = self._make()
+        start = self._held_gate()
+
+        class HeldDispatcher(WorkerDispatcher):
+            def _executor_loop(self) -> None:
+                start.wait(_WAIT)
+                super()._executor_loop()
+
+        with mock.patch("idalib_mcp.server.WorkerDispatcher", HeldDispatcher):
+            opening = supervisor.submit_open(self._path("a.exe"), context_id=self.ctx)
+        sid = opening.session_id
+        dispatcher = supervisor._dispatchers[sid]
+        ran: list[int] = []
+        follower = supervisor.submit_job(sid, "echo", 2, {}, lambda _job: ran.append(1))
+        finish = supervisor._finish_failed_open
+        guard = supervisor._guard_follower
+
+        def late_finish(record: Any, reason: str, **kwargs: Any) -> None:
+            _wait_until(lambda: dispatcher.current_job() is follower)
+            finish(record, reason, **kwargs)
+
+        def late_guard(job: Any, *args: Any) -> None:
+            if job is follower:
+                _wait_until(lambda: sid not in supervisor._pending)
+            guard(job, *args)
+
+        supervisor._finish_failed_open = late_finish
+        supervisor._guard_follower = late_guard
+        outcomes: list[str] = []
+        canceller = threading.Thread(
+            target=lambda: outcomes.append(supervisor.cancel_job(opening.job.id)), daemon=True
+        )
+        canceller.start()
+        self.assertTrue(opening.job.wait(_WAIT))
+        with self.assertLogs("idalib_mcp.dispatcher", level="ERROR"):
+            start.set()
+            self.assertTrue(follower.wait(_WAIT))
+        canceller.join(_WAIT)
+        self.assertFalse(canceller.is_alive())
+
+        self.assertEqual(outcomes, ["removed"])
+        self.assertEqual(ran, [])
+        expected = ("error", f"Database '{sid}' did not open: Cancelled")
+        self.assertEqual((follower.status, follower.info()["error"]), expected)
+        self.assertNotIn(sid, supervisor._dispatchers)
+        self.assertEqual(factory.workers, [])
 
 
 class OpenUiToolTests(unittest.TestCase):
