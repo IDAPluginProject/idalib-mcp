@@ -1,24 +1,31 @@
 from __future__ import annotations
 
+import http.client
 import importlib
+import itertools
+import json
+import os
 import socket
+import sys
 import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from fakeworker import FakeWorker, FakeWorkerFactory, make_supervisor, preserved_upstream
+from fakeworker import FakeWorker, FakeWorkerFactory, attach_fakes, make_supervisor, preserved_upstream
 from idalib_mcp.dispatcher import QueueClosedError, WorkerDispatcher
 from idalib_mcp.server import (
     _bound_instance_ui_url,
-    _enable_path_database_auto_open,
+    _install_supervisor,
     _instance_ui_url,
     _prefer_management_tools_in_tool_list,
     _save_session_before_close,
     _serve_stdio_instance_ui,
+    main,
 )
 
 
@@ -63,8 +70,6 @@ class FakeSession:
 class FakeSupervisor:
     def __init__(self) -> None:
         from idalib_mcp.cancellation import CancellationRegistry
-        self.opened: tuple[str, str] | None = None
-        self.forwarded: tuple[str, dict[str, Any]] | None = None
         self.sessions: dict[str, FakeSession] = {}
         self.saved: tuple[FakeSession, str, dict[str, Any]] | None = None
         self.save_result: dict[str, Any] = {"ok": True, "path": "sample.i64"}
@@ -82,17 +87,6 @@ class FakeSupervisor:
         if database == "existing-session":
             return "existing-session"
         raise KeyError(database)
-
-    def resolve_context_id(self) -> str:
-        return "context-id"
-
-    def open_session(self, input_path: str, *, context_id: str) -> str:
-        self.opened = (input_path, context_id)
-        return "opened-session"
-
-    def forward_raw(self, session: str, request: dict[str, Any]) -> dict[str, Any]:
-        self.forwarded = (session, request)
-        return {"ok": True}
 
     def call_worker_tool(self, session: FakeSession, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self.saved = (session, tool_name, arguments)
@@ -198,34 +192,6 @@ class ServerIntegrationPatchTests(unittest.TestCase):
         _save_session_before_close(supervisor, "sample")
 
         self.assertEqual(supervisor.saved, (session, "idb_save", {"path": ""}))
-
-    def test_analysis_call_auto_opens_existing_database_path(self) -> None:
-        upstream = FakeUpstream()
-        _enable_path_database_auto_open(upstream)
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            input_path = Path(temp_dir) / "sample.exe"
-            input_path.write_bytes(b"MZ")
-
-            result = upstream._handle_tools_call(
-                {
-                    "id": 7,
-                    "params": {
-                        "name": "decompile",
-                        "arguments": {
-                            "database": str(input_path),
-                            "addr": "0x401000",
-                        },
-                    },
-                }
-            )
-
-        self.assertEqual(result, {"ok": True})
-        self.assertEqual(upstream.supervisor.opened, (str(input_path), "context-id"))
-        self.assertIsNotNone(upstream.supervisor.forwarded)
-        session, forwarded = upstream.supervisor.forwarded
-        self.assertEqual(session, "opened-session")
-        self.assertEqual(forwarded["params"]["arguments"], {"addr": "0x401000"})
 
 
 class SupervisorDispatcherIntegrationTests(unittest.TestCase):
@@ -1073,6 +1039,412 @@ class SupervisorOpenPipelineTests(unittest.TestCase):
         self.assertEqual((follower.status, follower.info()["error"]), expected)
         self.assertNotIn(sid, supervisor._dispatchers)
         self.assertEqual(factory.workers, [])
+
+
+_JOB_TOOL_SCHEMAS = [
+    {
+        "name": "idalib_job_status",
+        "description": "Wait up to wait_seconds for a job; return its original result when finished, else its status.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Job id from a job ticket"},
+                "wait_seconds": {"type": "number", "description": "Seconds to wait for the job to finish (0-30)"},
+            },
+            "required": ["job_id"],
+        },
+    },
+    {
+        "name": "idalib_jobs",
+        "description": "List running, queued and recently finished jobs per database.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "database": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "description": "Database to inspect (session_id, filename or path); all if omitted",
+                },
+                "recent": {"type": "integer", "description": "Finished jobs to include per database (0-100)"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "idalib_job_cancel",
+        "description": (
+            "Cancel a job: queued jobs are dropped, an opening database's worker is terminated, "
+            "other running jobs finish and are discarded."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"job_id": {"type": "string", "description": "Job id to cancel"}},
+            "required": ["job_id"],
+        },
+    },
+]
+_JOB_TOOL_NAMES = [schema["name"] for schema in _JOB_TOOL_SCHEMAS]
+_SYNC_WAIT_ERROR = "--sync-wait must be a finite number >= 0"
+
+
+def _post_ping(worker: FakeWorker) -> Any:
+    conn = http.client.HTTPConnection(worker.host, worker.port, timeout=_WAIT)
+    try:
+        body = json.dumps({"jsonrpc": "2.0", "id": 99, "method": "ping"})
+        conn.request("POST", "/mcp", body, {"Content-Type": "application/json"})
+        return json.loads(conn.getresponse().read())
+    finally:
+        conn.close()
+
+
+class RouterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.temp_path = Path(temp_dir.name)
+        self.upstream = importlib.import_module("ida_pro_mcp.idalib_supervisor")
+        self.ctx = self.upstream.SHARED_FALLBACK_CONTEXT_ID
+        self.ids = itertools.count(100)
+
+    def _install(self, *, sync_wait: float = 0.1, **factory_kwargs: Any) -> tuple[Any, FakeWorkerFactory]:
+        """Wire a supervisor over fake workers; the caller is inside preserved_upstream."""
+        factory = FakeWorkerFactory(self.upstream, **factory_kwargs)
+        self.addCleanup(factory.stop_all)
+        supervisor = _install_supervisor(self.upstream, sync_wait=sync_wait)
+        attach_fakes(supervisor, factory)
+        wait_ready = supervisor._wait_worker_ready
+        supervisor._wait_worker_ready = lambda worker, timeout=_WAIT: wait_ready(worker, timeout=_WAIT)
+        return supervisor, factory
+
+    def _installed(self, **kwargs: Any) -> tuple[Any, FakeWorkerFactory]:
+        self.enterContext(preserved_upstream(self.upstream))
+        return self._install(**kwargs)
+
+    def _path(self, name: str) -> str:
+        path = self.temp_path / name
+        path.write_bytes(b"MZ")
+        return str(path.resolve())
+
+    def _open(self, supervisor: Any, factory: FakeWorkerFactory, name: str) -> tuple[Any, FakeWorker]:
+        session = supervisor.open_session(self._path(name), context_id=self.ctx)
+        return session, next(worker for worker in factory.workers if worker.port == session.port)
+
+    def _request(self, name: str, arguments: Any) -> dict[str, Any]:
+        params = {"name": name, "arguments": arguments}
+        return {"jsonrpc": "2.0", "id": next(self.ids), "method": "tools/call", "params": params}
+
+    def _dispatch(self, request: dict[str, Any]) -> Any:
+        return self.upstream.mcp.registry.dispatch(request)
+
+    def _call(self, name: str, arguments: Any) -> Any:
+        return self._dispatch(self._request(name, arguments))
+
+    def _structured(self, response: Any) -> Any:
+        result = response["result"]
+        self.assertIs(result["isError"], False, result)
+        return result["structuredContent"]
+
+    def _ticket_job_id(self, response: Any) -> str:
+        result = response["result"]
+        self.assertIs(result["isError"], True, result)
+        self.assertNotIn("structuredContent", result)
+        ticket = result["_meta"]["idalib_job"]
+        self.assertIs(ticket["pending"], True)
+        self.assertEqual(json.loads(result["content"][0]["text"]), ticket)
+        return ticket["job"]["job_id"]
+
+    def _finished(self, supervisor: Any, job_id: str) -> Any:
+        job = supervisor.find_job(job_id)
+        self.assertIsNotNone(job)
+        self.assertTrue(job.wait(_WAIT))
+        return job
+
+    def test_hybrid_fast_result_and_slow_ticket_then_status(self) -> None:
+        supervisor, factory = self._installed(sync_wait=0.3)
+        _session, worker = self._open(supervisor, factory, "a.exe")
+
+        fast = self._call("echo", {"x": 1})
+        self.assertEqual(self._structured(fast), {"tool": "echo", "arguments": {"x": 1}})
+        self.assertNotIn("_meta", fast["result"])
+
+        started = time.monotonic()
+        slow = self._call("slow_tool", {"seconds": 1.0})
+        self.assertLess(time.monotonic() - started, 0.9)
+        job_id = self._ticket_job_id(slow)
+        ticket = slow["result"]["_meta"]["idalib_job"]
+        self.assertEqual(
+            (ticket["job"]["tool"], ticket["job"]["status"], ticket["database_state"]),
+            ("slow_tool", "running", "ready"),
+        )
+        poll = {"tool": "idalib_job_status", "arguments": {"job_id": job_id, "wait_seconds": 30}}
+        self.assertEqual(ticket["poll"], poll)
+
+        status = self._call("idalib_job_status", {"job_id": job_id, "wait_seconds": 5})
+        self.assertEqual(self._structured(status), {"slept": 1.0})
+        info = status["result"]["_meta"]["idalib_job"]
+        self.assertEqual((info["job_id"], info["status"]), (job_id, "ok"))
+        self.assertEqual(worker.call_names()[-2:], ["echo", "slow_tool"])
+
+    def test_routes_queue_behind_queued_tool(self) -> None:
+        routes = {
+            "worker tool by input path": lambda a: ("echo", {"which": "route", "database": a.input_path}),
+            "idalib_save": lambda a: ("idalib_save", {"session_id": a.session_id}),
+            "idalib_close": lambda a: ("idalib_close", {"session_id": a.session_id}),
+        }
+        for route, make_call in routes.items():
+            with self.subTest(route=route), preserved_upstream(self.upstream):
+                supervisor, factory = self._install(sync_wait=0.1)
+                session, worker = self._open(supervisor, factory, "a.exe")
+                slow_id = self._ticket_job_id(self._call("slow_tool", {"seconds": 1.0}))
+                self.assertTrue(_wait_until(lambda: "slow_tool" in worker.call_names()))
+                t2_id = self._ticket_job_id(self._call("echo", {"which": "T2"}))
+                name, arguments = make_call(session)
+                route_id = self._ticket_job_id(self._call(name, arguments))
+                self.assertFalse(supervisor.find_job(slow_id).is_done())
+
+                for job_id in (slow_id, t2_id, route_id):
+                    self.assertEqual(self._finished(supervisor, job_id).status, "ok")
+                # A route that bypassed the queue would connect during slow_tool and be accepted before T2.
+                names = worker.call_names()
+                self.assertEqual(names[names.index("slow_tool") :], ["slow_tool", "echo", name])
+                echoed = [call.arguments for call in worker.calls() if call.name == "echo"]
+                self.assertEqual(echoed[0], {"which": "T2"})
+                if name == "echo":
+                    self.assertEqual(echoed[1:], [{"which": "route"}])
+
+        with self.subTest(route="auto-open"), preserved_upstream(self.upstream):
+            gate = threading.Event()
+            self.addCleanup(gate.set)
+            supervisor, factory = self._install(sync_wait=_WAIT, open_gate=gate)
+            path = self._path("b.exe")
+            responses: dict[str, Any] = {}
+
+            def send(which: str) -> None:
+                responses[which] = self._call("echo", {"which": which, "database": path})
+
+            first = threading.Thread(target=send, args=("first",), daemon=True)
+            first.start()
+            self.assertTrue(
+                _wait_until(lambda: bool(factory.workers) and "idalib_open" in factory.workers[0].call_names())
+            )
+            sid = supervisor.resolve_target(path)
+            self.assertEqual(supervisor.database_state(sid), "opening")
+            second = threading.Thread(target=send, args=("second",), daemon=True)
+            second.start()
+            queued = lambda: [job["tool"] for job in supervisor.job_databases(sid, 0)[0]["queued"]]
+            self.assertTrue(_wait_until(lambda: queued() == ["echo", "echo"]))
+            gate.set()
+            for sender in (first, second):
+                sender.join(_WAIT)
+                self.assertFalse(sender.is_alive())
+
+            for which in ("first", "second"):
+                self.assertEqual(self._structured(responses[which]), {"tool": "echo", "arguments": {"which": which}})
+            self.assertEqual(factory.workers[0].call_names(), ["ping", "idalib_open", "echo", "echo"])
+            self.assertEqual(supervisor.context_bindings[self.ctx], sid)
+
+    def test_cancel_running_job_holds_queue_until_worker_returns(self) -> None:
+        supervisor, factory = self._installed(sync_wait=0.1)
+        _session, worker = self._open(supervisor, factory, "a.exe")
+        t1_id = self._ticket_job_id(self._call("slow_tool", {"seconds": 1.0}))
+        self.assertTrue(_wait_until(lambda: "slow_tool" in worker.call_names()))
+        t2_id = self._ticket_job_id(self._call("echo", {"which": "T2"}))
+
+        cancel = self._call("idalib_job_cancel", {"job_id": t1_id})
+        pings: list[Any] = []
+        pinger = threading.Thread(target=lambda: pings.append(_post_ping(worker)), daemon=True)
+        pinger.start()
+
+        outcome = self._structured(cancel)
+        self.assertEqual((outcome["job_id"], outcome["outcome"]), (t1_id, "cancelling"))
+        self.assertEqual(outcome["job"]["status"], "cancelling")
+        t1 = self._finished(supervisor, t1_id)
+        t2 = self._finished(supervisor, t2_id)
+        pinger.join(_WAIT)
+        self.assertFalse(pinger.is_alive())
+        self.assertEqual(pings, [{"jsonrpc": "2.0", "result": {}, "id": 99}])
+        self.assertEqual((t1.status, t2.status), ("cancelled", "ok"))
+        # An executor that popped T2 at the cancel would connect T2 before the ping.
+        names = worker.call_names()
+        self.assertEqual(names[names.index("slow_tool") :], ["slow_tool", "ping", "echo"])
+        status = self._call("idalib_job_status", {"job_id": t1_id, "wait_seconds": 0})["result"]
+        self.assertIs(status["isError"], True)
+        self.assertEqual(json.loads(status["content"][0]["text"])["error"], "Job was cancelled")
+
+    def test_queued_save_does_not_rebind_after_switch(self) -> None:
+        supervisor, factory = self._installed(sync_wait=0.1)
+        a, a_worker = self._open(supervisor, factory, "a.exe")
+        b, _b_worker = self._open(supervisor, factory, "b.exe")
+        self.assertEqual(supervisor.context_bindings[self.ctx], b.session_id)
+        slow_id = self._ticket_job_id(self._call("slow_tool", {"seconds": 0.8, "database": a.session_id}))
+        self.assertTrue(_wait_until(lambda: "slow_tool" in a_worker.call_names()))
+
+        save_id = self._ticket_job_id(self._call("idalib_save", {"session_id": a.session_id}))
+        self.assertEqual(supervisor.context_bindings[self.ctx], a.session_id)
+        switched = self._structured(self._call("idalib_switch", {"session_id": b.session_id}))
+        self.assertIs(switched["success"], True)
+
+        self.assertEqual(self._finished(supervisor, save_id).status, "ok")
+        self.assertEqual(self._finished(supervisor, slow_id).status, "ok")
+        self.assertEqual(supervisor.context_bindings[self.ctx], b.session_id)
+        self.assertEqual(a_worker.call_names()[-2:], ["slow_tool", "idalib_save"])
+
+    def test_idalib_open_string_encoded_arguments_returns_ticket(self) -> None:
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        # Bounds a router that runs the open inline: it would return only once the gate opens.
+        release = threading.Timer(3.0, gate.set)
+        release.daemon = True
+        self.addCleanup(release.cancel)
+        supervisor, _factory = self._installed(sync_wait=0.3, open_gate=gate)
+        path = self._path("a.exe")
+        release.start()
+
+        started = time.monotonic()
+        response = self._call("idalib_open", json.dumps({"input_path": path}))
+        elapsed = time.monotonic() - started
+        job_id = self._ticket_job_id(response)
+        self.assertLess(elapsed, 1.5)
+        ticket = response["result"]["_meta"]["idalib_job"]
+        self.assertEqual((ticket["job"]["tool"], ticket["job"]["kind"]), ("idalib_open", "open"))
+        self.assertIn(ticket["database_state"], ("spawning", "opening"))
+
+        gate.set()
+        opened = self._structured(self._call("idalib_job_status", {"job_id": job_id, "wait_seconds": 5}))
+        self.assertIs(opened["success"], True)
+        self.assertEqual((opened["session"]["input_path"], opened["context_id"]), (path, self.ctx))
+        self.assertIn(opened["session"]["session_id"], supervisor.sessions)
+
+    def test_management_param_errors_match_original_dispatch(self) -> None:
+        supervisor, factory = self._installed()
+        path = self._path("a.exe")
+        cases = [
+            ("idalib_open", [path]),
+            ("idalib_open", "[1, 2]"),
+            ("idalib_open", {"input_path": path, "session_id": "123"}),
+            ("idalib_open", {"input_path": path, "unexpected": 1}),
+            ("idalib_open", {}),
+            ("idalib_close", {"session_id": 5}),
+            ("idalib_save", {"session_id": "123"}),
+            ("idalib_warmup", {"init_hexrays": "yes"}),
+        ]
+        for name, arguments in cases:
+            with self.subTest(name=name, arguments=arguments):
+                request = self._request(name, arguments)
+                response = self._dispatch(request)
+                self.assertEqual(response, self.upstream._original_dispatch(request))
+                self.assertTrue("error" in response or response["result"]["isError"], response)
+        self.assertEqual(factory.workers, [])
+        self.assertEqual(supervisor.list_sessions(None), [])
+
+    def test_sync_wait_rejects_non_finite_and_negative(self) -> None:
+        reached = mock.Mock(side_effect=AssertionError("reached _install_supervisor"))
+        with (
+            mock.patch("idalib_mcp.server._install_supervisor", reached),
+            mock.patch("idalib_mcp.server.validate_ida_home", side_effect=lambda path: path),
+            mock.patch("logging.basicConfig"),
+        ):
+            for value in ("nan", "inf", "-inf", "-1", "-0.5"):
+                with self.subTest(value=value), mock.patch.object(sys, "argv", ["idalib-mcp", f"--sync-wait={value}"]):
+                    with self.assertRaises(SystemExit) as caught:
+                        main()
+                    self.assertEqual(caught.exception.code, _SYNC_WAIT_ERROR)
+            with (
+                mock.patch.dict(os.environ, {"IDA_MCP_SYNC_WAIT": "inf"}),
+                mock.patch.object(sys, "argv", ["idalib-mcp"]),
+            ):
+                with self.assertRaises(SystemExit) as caught:
+                    main()
+                self.assertEqual(caught.exception.code, _SYNC_WAIT_ERROR)
+            reached.assert_not_called()
+
+            with mock.patch.object(sys, "argv", ["idalib-mcp", "--sync-wait", "0"]):
+                with self.assertRaises(AssertionError):
+                    main()
+        self.assertEqual(reached.call_args.kwargs["sync_wait"], 0.0)
+
+    def test_sync_wait_zero_returns_ticket_at_once(self) -> None:
+        supervisor, factory = self._installed(sync_wait=0)
+        self.assertEqual(supervisor.sync_wait, 0)
+        self._open(supervisor, factory, "a.exe")
+
+        started = time.monotonic()
+        response = self._call("slow_tool", {"seconds": 1.0})
+        self.assertLess(time.monotonic() - started, 0.5)
+        job_id = self._ticket_job_id(response)
+        self.assertEqual(self._finished(supervisor, job_id).status, "ok")
+
+    def test_tools_call_list_params_matches_original_dispatch(self) -> None:
+        original_handler = self.upstream._handle_tools_call
+        supervisor, factory = self._installed()
+        path = self._path("a.exe")
+        _session, worker = self._open(supervisor, factory, "a.exe")
+        fixed = datetime(2026, 1, 2, 3, 4, 5)
+
+        class FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz: Any = None) -> datetime:
+                return fixed
+
+        with mock.patch("idalib_mcp.server.datetime", FrozenDatetime):
+            for params in ([], ["idalib_list", {}, None, "extra"], ["idalib_list"], ["idalib_open", {"input_path": path}]):
+                with self.subTest(params=params):
+                    request = {"jsonrpc": "2.0", "id": next(self.ids), "method": "tools/call", "params": params}
+                    response = self._dispatch(request)
+                    self.assertEqual(response, self.upstream._original_dispatch(request))
+                    if params and params[0] == "idalib_open":
+                        self.assertIs(self._structured(response)["success"], True)
+
+        echoed = self._dispatch({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": ["echo", {"which": "u"}]})
+        self.assertEqual(self._structured(echoed), {"tool": "echo", "arguments": {"which": "u"}})
+        self.assertEqual((worker.calls()[-1].name, worker.calls()[-1].arguments), ("echo", {"which": "u"}))
+
+        hidden = {"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {"name": "list_instances"}}
+        expected = original_handler(hidden)
+        self.assertIs(expected["result"]["isError"], True)
+        self.assertEqual(self._dispatch({**hidden, "params": ["list_instances"]}), expected)
+        self.assertEqual(self._dispatch(hidden), expected)
+
+    def test_tools_list_adds_only_job_tools(self) -> None:
+        self._installed()
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        with_jobs = self._dispatch(request)["result"]["tools"]
+        self.assertTrue(set(_JOB_TOOL_NAMES) <= self.upstream.IDALIB_MANAGEMENT_TOOLS)
+        for name in _JOB_TOOL_NAMES:
+            del self.upstream.mcp.tools.methods[name]
+            self.upstream.IDALIB_MANAGEMENT_TOOLS.discard(name)
+        without = self._dispatch(request)["result"]["tools"]
+
+        self.assertEqual([tool for tool in with_jobs if tool["name"] not in _JOB_TOOL_NAMES], without)
+        self.assertEqual([tool for tool in with_jobs if tool["name"] in _JOB_TOOL_NAMES], _JOB_TOOL_SCHEMAS)
+        self.assertEqual([tool["name"] for tool in without][-2:], ["slow_tool", "echo"])
+
+    def test_tools_call_notification_returns_none(self) -> None:
+        supervisor, factory = self._installed(sync_wait=_WAIT)
+        session, worker = self._open(supervisor, factory, "a.exe")
+        params = {"name": "slow_tool", "arguments": {"seconds": 1.0}}
+
+        started = time.monotonic()
+        self.assertIsNone(self._dispatch({"jsonrpc": "2.0", "method": "tools/call", "params": params}))
+        self.assertLess(time.monotonic() - started, 0.5)
+
+        self.assertTrue(_wait_until(lambda: any(c.name == "slow_tool" and c.end for c in worker.calls())))
+        self.assertEqual(worker.calls()[-1].arguments, {"seconds": 1.0})
+        recent = lambda: supervisor.job_databases(session.session_id, 5)[0]["recent"]
+        self.assertTrue(_wait_until(lambda: [(j["tool"], j["status"]) for j in recent()][:1] == [("slow_tool", "ok")]))
+
+    def test_analysis_call_auto_opens_existing_database_path(self) -> None:
+        supervisor, factory = self._installed(sync_wait=_WAIT)
+        path = self._path("sample.exe")
+
+        response = self._call("decompile", {"database": path, "addr": "0x401000"})
+
+        self.assertEqual(self._structured(response), {"tool": "decompile", "arguments": {"addr": "0x401000"}})
+        (sid,) = supervisor.sessions
+        self.assertEqual(supervisor.sessions[sid].input_path, path)
+        self.assertEqual(supervisor.context_bindings[self.ctx], sid)
+        worker = factory.workers[0]
+        self.assertEqual(worker.call_names(), ["ping", "idalib_open", "decompile"])
+        self.assertEqual(worker.calls()[-1].arguments, {"addr": "0x401000"})
 
 
 class OpenUiToolTests(unittest.TestCase):

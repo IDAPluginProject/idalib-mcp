@@ -4,6 +4,7 @@ import argparse
 import importlib
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -15,13 +16,35 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Annotated, Any, BinaryIO, Callable, Optional
 from urllib.parse import unquote, urlparse
 
-from .cancellation import CancellationRegistry
+from .cancellation import CancellationRegistry, get_active_socket, spawn_socket_watcher
 from .config import default_ida_home_from_env, validate_ida_home
 from .dispatcher import CancelledError, Job, QueueClosedError, WorkerDispatcher
 from .installer import list_available_clients, print_mcp_config, run_install_command
+from .jobs import (
+    JOB_ROUTED_TOOLS,
+    NO_RESULT,
+    JobArgumentError,
+    Rejected,
+    ToolsCall,
+    ToolsCallValidator,
+    parse_job_cancel_arguments,
+    parse_job_status_arguments,
+    parse_jobs_arguments,
+    render_cancel,
+    render_error,
+    render_job_failed,
+    render_job_status,
+    render_jobs,
+    render_open_result,
+    render_request_cancelled,
+    render_ticket,
+    render_unknown_job,
+    wait_for_job,
+)
+from .stdio_transport import serve_stdio
 from .winjob import assign_process_to_job, create_kill_on_close_job
 
 
@@ -1808,80 +1831,309 @@ def _prefer_management_tools_in_tool_list(upstream) -> None:
     upstream._handle_tools_list = _handle_tools_list_management_first
 
 
-def _enable_path_database_auto_open(upstream) -> None:
-    def _resolve_or_open_path_database(supervisor, database: str | None):
+def _is_hidden_tool(upstream: Any, name: Any) -> bool:
+    return isinstance(name, str) and name in upstream.IDALIB_HIDDEN_PLUGIN_TOOLS
+
+
+def _hidden_tool_result(upstream: Any, tool_name: str) -> dict[str, Any]:
+    return upstream._call_tool_result(
+        {
+            "error": (
+                f"{tool_name} is a GUI-plugin routing tool and is not "
+                "available through idalib-mcp. Use idalib_list or "
+                "idalib_switch instead."
+            )
+        },
+        is_error=True,
+    )
+
+
+class _ToolsCallRoute:
+    """One validated tools/call: answered inline, or submitted as a job and waited for (hybrid)."""
+
+    def __init__(self, upstream: Any, supervisor: Any, request_obj: dict[str, Any], call: ToolsCall) -> None:
+        self.upstream = upstream
+        self.supervisor = supervisor
+        self.request_obj = request_obj
+        self.request_id = request_obj.get("id")
+        self.notification = "id" not in request_obj
+        self.name = call.name
+        self.arguments = call.arguments
+        self.meta = call.meta
+        self.handle: Any = None
+        self.owned: list[Job] = []
+
+    def run(self) -> dict[str, Any] | None:
+        name = self.name
+        if _is_hidden_tool(self.upstream, name):
+            return self.reply(_hidden_tool_result(self.upstream, name))
+        if name == "idalib_job_status":
+            return self._job_status()
+        if name == "idalib_jobs":
+            return self._jobs()
+        if name == "idalib_job_cancel":
+            return self._job_cancel()
+        if name not in JOB_ROUTED_TOOLS and name in self.upstream.IDALIB_MANAGEMENT_TOOLS:
+            return self.upstream._original_dispatch(self.request_obj)
+        self.handle = self._register_cancel_handle()
         try:
-            return supervisor.resolve_session(database)
+            if name == "idalib_open":
+                return self._open()
+            if name in JOB_ROUTED_TOOLS:
+                return self._database_tool()
+            return self._worker_tool()
+        finally:
+            self._release_cancel_handle()
+
+    def reply(self, result: dict[str, Any]) -> dict[str, Any] | None:
+        if self.notification:
+            return None
+        return self.upstream._jsonrpc_result(self.request_id, result)
+
+    # --- cancel handle and hybrid wait ---------------------------------------
+
+    def _register_cancel_handle(self) -> Any:
+        if self.notification or self.request_id is None:
+            return None
+        try:
+            return self.supervisor._cancels.register(self.request_id)
+        except TypeError:
+            return None
+
+    def _release_cancel_handle(self) -> None:
+        if self.handle is not None:
+            self.supervisor._cancels.unregister(self.request_id)
+            self.handle = None
+
+    def _wait_for(self, job: Job, timeout: float) -> str:
+        handle = self.handle
+        stop = threading.Event()
+        sock = get_active_socket()
+        if handle is not None and sock is not None:
+            spawn_socket_watcher(handle, sock, stop)
+        try:
+            return wait_for_job(job, timeout, None if handle is None else handle.event)
+        finally:
+            stop.set()
+
+    def _wait(self, job: Job, on_done: Callable[[], dict[str, Any] | None]) -> dict[str, Any] | None:
+        if self.notification:
+            return None
+        supervisor = self.supervisor
+        outcome = self._wait_for(job, supervisor.sync_wait)
+        if outcome == "done":
+            return on_done()
+        if outcome == "cancelled":
+            for owned in reversed(self.owned):
+                if not owned.is_done():
+                    supervisor.cancel_job(owned.id)
+            return self.reply(render_request_cancelled())
+        return self.reply(render_ticket(job.info(), supervisor.database_state(job.session_id)))
+
+    def _holder_done(self, job: Job, holder: list[Any]) -> Callable[[], dict[str, Any] | None]:
+        def done() -> dict[str, Any] | None:
+            if job.status == "ok" and holder:
+                return holder[0]
+            return self.reply(render_job_failed(job.info()))
+
+        return done
+
+    # --- queued routes --------------------------------------------------------
+
+    def _open(self) -> dict[str, Any] | None:
+        supervisor = self.supervisor
+        args = self.arguments
+        try:
+            context_id = supervisor.resolve_context_id()
+            submission = supervisor.submit_open(
+                args["input_path"],
+                run_auto_analysis=args["run_auto_analysis"],
+                session_id=args["session_id"],
+                context_id=context_id,
+                json_rpc_id=self.request_id,
+            )
+        except Exception as exc:
+            return self.reply(render_error(str(exc)))
+        job = submission.job
+        if job is None:
+            stored = {"session": submission.session.to_dict()}
+            return self.reply(render_open_result(stored, supervisor.context_fields(context_id)))
+        if submission.created:
+            self.owned.append(job)
+
+        def done() -> dict[str, Any] | None:
+            info = job.info()
+            if info.get("status") != "ok":
+                return self.reply(render_job_failed(info))
+            try:
+                stored = job.result()
+            except LookupError:
+                return self.reply(render_job_status(job.id, info, "open"))
+            return self.reply(render_open_result(stored, supervisor.context_fields(context_id)))
+
+        return self._wait(job, done)
+
+    def _database_tool(self) -> dict[str, Any] | None:
+        upstream = self.upstream
+        supervisor = self.supervisor
+        request_obj = self.request_obj
+        name = self.name
+        session_id = self.arguments["session_id"]
+        try:
+            if name == "idalib_close":
+                context_id, target = None, session_id
+            else:
+                context_id = supervisor.resolve_context_id()
+                target = supervisor.resolve_target(session_id)
         except Exception:
-            if not database:
+            return upstream._original_dispatch(request_obj)
+        holder: list[Any] = []
+
+        def body(_job: Job) -> Any:
+            response = upstream._original_dispatch(request_obj)
+            holder.append(response)
+            return response
+
+        kind = "close" if name == "idalib_close" else "tool"
+        try:
+            job = supervisor.submit_job(target, name, self.request_id, self.arguments, body, kind=kind)
+        except LookupError:
+            return upstream._original_dispatch(request_obj)
+        except QueueClosedError as exc:
+            return self.reply(render_error(str(exc)))
+        if context_id is not None and session_id:
+            supervisor.bind_context(context_id, target)
+        self.owned.append(job)
+        return self._wait(job, self._holder_done(job, holder))
+
+    def _worker_tool(self) -> dict[str, Any] | None:
+        supervisor = self.supervisor
+        name = self.name
+        arguments = dict(self.arguments)
+        database = arguments.pop("database", None)
+        params: dict[str, Any] = {"name": name, "arguments": arguments}
+        if self.meta is not None:
+            params["_meta"] = self.meta
+        forwarded = {**self.request_obj, "params": params}
+        holder: list[Any] = []
+
+        def body(_job: Job) -> Any:
+            session = supervisor.resolve_session()
+            response = supervisor._decorate_error(name, supervisor.forward_raw(session, forwarded))
+            holder.append(response)
+            return response
+
+        try:
+            target = self._resolve_or_open(database)
+            job = supervisor.submit_job(target, name, self.request_id, arguments, body)
+        except Exception as exc:
+            return self.reply(render_error(str(exc)))
+        self.owned.append(job)
+        return self._wait(job, self._holder_done(job, holder))
+
+    def _resolve_or_open(self, database: Any) -> str:
+        """Resolve the target database; an existing file path that matches none is auto-opened."""
+        supervisor = self.supervisor
+        try:
+            return supervisor.resolve_target(database)
+        except Exception:
+            if not isinstance(database, str) or not database:
                 raise
             candidate = Path(database).expanduser()
             if not candidate.exists():
                 raise
-            context_id = supervisor.resolve_context_id()
-            return supervisor.open_session(str(candidate), context_id=context_id)
+        submission = supervisor.submit_open(
+            str(candidate), context_id=supervisor.resolve_context_id(), json_rpc_id=self.request_id
+        )
+        if submission.created:
+            self.owned.append(submission.job)
+        return submission.session_id
+
+    # --- job tools (inline) ---------------------------------------------------
+
+    def _job_status(self) -> dict[str, Any] | None:
+        supervisor = self.supervisor
+        try:
+            job_id, wait_seconds = parse_job_status_arguments(self.arguments)
+        except JobArgumentError as exc:
+            return self.reply(render_error(str(exc)))
+        job = supervisor.find_job(job_id)
+        if job is None:
+            return self.reply(render_unknown_job(job_id))
+        if self.notification:
+            return None
+        if wait_seconds > 0:
+            self.handle = self._register_cancel_handle()
+            try:
+                outcome = self._wait_for(job, wait_seconds)
+            finally:
+                self._release_cancel_handle()
+            if outcome == "cancelled":
+                return self.reply(render_request_cancelled())
+        info = job.info()
+        stored: Any = NO_RESULT
+        if info.get("status") == "ok":
+            try:
+                stored = job.result()
+            except LookupError:
+                stored = NO_RESULT
+        open_fields = None
+        if job.kind == "open":
+            try:
+                context_id = supervisor.resolve_context_id()
+            except RuntimeError:
+                context_id = stored.get("context_id") if isinstance(stored, dict) else None
+            open_fields = supervisor.context_fields(context_id)
+        return self.reply(
+            render_job_status(
+                job_id,
+                info,
+                job.kind,
+                stored=stored,
+                database_state=supervisor.database_state(job.session_id),
+                open_fields=open_fields,
+            )
+        )
+
+    def _jobs(self) -> dict[str, Any] | None:
+        try:
+            database, recent = parse_jobs_arguments(self.arguments)
+        except JobArgumentError as exc:
+            return self.reply(render_error(str(exc)))
+        try:
+            databases = self.supervisor.job_databases(database, recent)
+        except (LookupError, RuntimeError) as exc:
+            return self.reply(render_error(str(exc)))
+        return self.reply(render_jobs(databases))
+
+    def _job_cancel(self) -> dict[str, Any] | None:
+        supervisor = self.supervisor
+        try:
+            job_id = parse_job_cancel_arguments(self.arguments)
+        except JobArgumentError as exc:
+            return self.reply(render_error(str(exc)))
+        job = supervisor.find_job(job_id)
+        outcome = "unknown" if job is None else supervisor.cancel_job(job_id)
+        if job is None or outcome == "unknown":
+            return self.reply(render_unknown_job(job_id))
+        return self.reply(render_cancel(job_id, outcome, job.kind, job.info()))
+
+
+def _enable_path_database_auto_open(upstream) -> None:
+    """Install the tools/call router."""
+    validator = ToolsCallValidator(upstream)
 
     def _handle_tools_call_with_path_open(request_obj: dict[str, Any]) -> dict[str, Any] | None:
-        from .cancellation import get_active_socket, spawn_socket_watcher
-
         supervisor = upstream._require_supervisor()
-        params = request_obj.get("params") or {}
-        tool_name = params.get("name", "")
-        request_id = request_obj.get("id")
-
-        if tool_name in upstream.IDALIB_MANAGEMENT_TOOLS:
-            return upstream._original_dispatch(request_obj)
-        if tool_name in upstream.IDALIB_HIDDEN_PLUGIN_TOOLS:
+        params = request_obj.get("params")
+        if isinstance(params, dict) and _is_hidden_tool(upstream, params.get("name")):
             return upstream._jsonrpc_result(
-                request_id,
-                upstream._call_tool_result(
-                    {
-                        "error": (
-                            f"{tool_name} is a GUI-plugin routing tool and is not "
-                            "available through idalib-mcp. Use idalib_list or "
-                            "idalib_switch instead."
-                        )
-                    },
-                    is_error=True,
-                ),
+                request_obj.get("id"), _hidden_tool_result(upstream, params["name"])
             )
-
-        arguments = dict(params.get("arguments") or {})
-        database = arguments.pop("database", None)
-        try:
-            session = _resolve_or_open_path_database(supervisor, database)
-        except Exception as exc:
-            return upstream._jsonrpc_result(
-                request_id,
-                upstream._call_tool_result({"error": str(exc)}, is_error=True),
-            )
-
-        forwarded = dict(request_obj)
-        forwarded["params"] = dict(params)
-        forwarded["params"]["arguments"] = arguments
-
-        handle = supervisor._cancels.register(request_id) if request_id is not None else None
-        sock = get_active_socket()
-        stop = threading.Event()
-        watcher = spawn_socket_watcher(handle, sock, stop) if (handle and sock) else None
-        try:
-            return supervisor.forward_raw(session, forwarded)
-        except CancelledError:
-            return upstream._jsonrpc_result(
-                request_id,
-                upstream._call_tool_result({"error": "Request cancelled"}, is_error=True),
-            )
-        except Exception as exc:
-            return upstream._jsonrpc_result(
-                request_id,
-                upstream._call_tool_result({"error": str(exc)}, is_error=True),
-            )
-        finally:
-            stop.set()
-            if watcher is not None:
-                watcher.join(timeout=1.0)
-            if handle is not None and request_id is not None:
-                supervisor._cancels.unregister(request_id)
+        call = validator(request_obj)
+        if isinstance(call, Rejected):
+            return call.response
+        return _ToolsCallRoute(upstream, supervisor, request_obj, call).run()
 
     upstream._handle_tools_call = _handle_tools_call_with_path_open
 
@@ -1915,6 +2167,77 @@ def _wrap_dispatch_supervisor(upstream) -> None:
         return original(request)
 
     upstream.mcp.registry.dispatch = wrapped
+
+
+def _register_job_tools(upstream) -> None:
+    def idalib_job_status(
+        job_id: Annotated[str, "Job id from a job ticket"],
+        wait_seconds: Annotated[float, "Seconds to wait for the job to finish (0-30)"] = 30,
+    ):
+        """Wait up to wait_seconds for a job; return its original result when finished, else its status."""
+        raise RuntimeError("idalib_job_status is handled by the idalib-mcp router")
+
+    def idalib_jobs(
+        database: Annotated[
+            Optional[str], "Database to inspect (session_id, filename or path); all if omitted"
+        ] = None,
+        recent: Annotated[int, "Finished jobs to include per database (0-100)"] = 20,
+    ):
+        """List running, queued and recently finished jobs per database."""
+        raise RuntimeError("idalib_jobs is handled by the idalib-mcp router")
+
+    def idalib_job_cancel(job_id: Annotated[str, "Job id to cancel"]):
+        """Cancel a job: queued jobs are dropped, an opening database's worker is terminated, other running jobs finish and are discarded."""
+        raise RuntimeError("idalib_job_cancel is handled by the idalib-mcp router")
+
+    for func in (idalib_job_status, idalib_jobs, idalib_job_cancel):
+        upstream.mcp.tool(func)
+        upstream.IDALIB_MANAGEMENT_TOOLS.add(func.__name__)
+
+
+def _install_supervisor(
+    upstream: Any,
+    *,
+    isolated_contexts: bool = False,
+    max_workers: int = 4,
+    worker_args: list[str] | None = None,
+    ida_home: Path | None = None,
+    show_worker_io: bool = False,
+    sync_wait: float = 15.0,
+    host: str = "127.0.0.1",
+    port: int = 8745,
+) -> Any:
+    """Build the managed supervisor and wire the router, tools and dispatch; does not open or serve."""
+    supervisor = _build_managed_supervisor_class(upstream)(
+        upstream.mcp,
+        isolated_contexts=isolated_contexts,
+        max_workers=max_workers,
+        worker_args=worker_args,
+        ida_home=ida_home,
+        show_worker_io=show_worker_io,
+        sync_wait=sync_wait,
+    )
+    upstream.supervisor = supervisor
+    _prefer_management_tools_in_tool_list(upstream)
+    _enable_path_database_auto_open(upstream)
+    _register_open_ui_tool(upstream, host=host, port=port)
+    _register_job_tools(upstream)
+    upstream.mcp.registry.dispatch = upstream.dispatch_supervisor
+    _wrap_dispatch_supervisor(upstream)
+    upstream.mcp.require_streamable_http_session = isolated_contexts
+    return supervisor
+
+
+def _run_stdio(upstream: Any, *, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> None:
+    def set_transport_context(context_id: str | None) -> None:
+        upstream.mcp._transport_session_id.data = context_id
+
+    serve_stdio(
+        lambda request: upstream.mcp.registry.dispatch(request),
+        set_transport_context=set_transport_context,
+        stdin=stdin,
+        stdout=stdout,
+    )
 
 
 def main() -> None:
@@ -1978,8 +2301,17 @@ def main() -> None:
         action="store_true",
         help="Inherit worker stdout/stderr instead of suppressing it",
     )
+    parser.add_argument(
+        "--sync-wait",
+        type=float,
+        default=os.environ.get("IDA_MCP_SYNC_WAIT", "15"),
+        metavar="SECONDS",
+        help="Seconds a call waits for its result before returning a job ticket (0 = no wait, default: 15)",
+    )
     parser.add_argument("input_path", type=Path, nargs="?", help="Optional binary to open on startup")
     args = parser.parse_args()
+    if not math.isfinite(args.sync_wait) or args.sync_wait < 0:
+        raise SystemExit("--sync-wait must be a finite number >= 0")
 
     if args.list_clients:
         list_available_clients()
@@ -2016,7 +2348,6 @@ def main() -> None:
 
     ida_home = validate_ida_home(args.ida_home) if args.ida_home is not None else None
     upstream = _load_upstream_supervisor()
-    managed_supervisor_class = _build_managed_supervisor_class(upstream)
 
     worker_args: list[str] = []
     if args.verbose:
@@ -2026,20 +2357,17 @@ def main() -> None:
     if args.profile is not None:
         worker_args.extend(["--profile", str(args.profile)])
 
-    upstream.supervisor = managed_supervisor_class(
-        upstream.mcp,
+    _install_supervisor(
+        upstream,
         isolated_contexts=args.isolated_contexts,
         max_workers=args.max_workers,
         worker_args=worker_args,
         ida_home=ida_home,
         show_worker_io=args.show_worker_io,
+        sync_wait=args.sync_wait,
+        host=args.host,
+        port=args.port,
     )
-    _prefer_management_tools_in_tool_list(upstream)
-    _enable_path_database_auto_open(upstream)
-    _register_open_ui_tool(upstream, host=args.host, port=args.port)
-    upstream.mcp.registry.dispatch = upstream.dispatch_supervisor
-    _wrap_dispatch_supervisor(upstream)
-    upstream.mcp.require_streamable_http_session = args.isolated_contexts
 
     if args.input_path is not None:
         startup_context_id = (
@@ -2065,7 +2393,7 @@ def main() -> None:
             ui_url = _serve_stdio_instance_ui(upstream, args.host, args.port, handler)
             logger.info("Instance UI: %s", ui_url)
             print(f"Instance UI: {ui_url}", file=sys.stderr, flush=True)
-            upstream.mcp.stdio()
+            _run_stdio(upstream)
         else:
             logger.info("Instance UI: %s", _instance_ui_url(args.host, args.port))
             stop = threading.Event()
