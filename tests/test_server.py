@@ -325,21 +325,24 @@ class SupervisorQueueCoreTests(unittest.TestCase):
         with preserved_upstream(self.upstream):
             self.upstream.supervisor = self.supervisor
             slow = self._submit_slow(session, 0.8)
+            queued = self.supervisor.submit_job(session.session_id, "echo", 2, {}, self._tool_body("echo", {}))
             reader = threading.Thread(
                 target=lambda: responses.append(self.upstream._handle_resources_read(request)), daemon=True
             )
             reader.start()
-            self.assertTrue(_wait_until(lambda: self._queued(dispatcher) == [("resources/read", "rpc")]))
+            expected_queue = [("echo", "tool"), ("resources/read", "rpc")]
+            self.assertTrue(_wait_until(lambda: self._queued(dispatcher) == expected_queue))
             self.assertFalse(slow.is_done())
             self.assertNotIn("resources/read", worker.call_names())
             reader.join(_WAIT)
             self.assertFalse(reader.is_alive())
+            self.assertTrue(queued.wait(_WAIT))
 
             contents = [{"uri": "ida://fake", "mimeType": "application/json", "text": "{}"}]
             self.assertEqual(responses, [{"jsonrpc": "2.0", "result": {"contents": contents}, "id": 5}])
-            self.assertEqual(slow.status, "ok")
-            read_call = self._call(worker, "resources/read")
-            self.assertGreaterEqual(read_call.start, self._call(worker, "slow_tool").end)
+            self.assertEqual((slow.status, queued.status), ("ok", "ok"))
+            # A read that bypassed the queue would connect during slow_tool and be accepted before echo.
+            self.assertEqual(worker.call_names()[-3:], ["slow_tool", "echo", "resources/read"])
 
     def test_cancelled_queued_job_never_reaches_worker(self) -> None:
         session = self._open("a.exe")
