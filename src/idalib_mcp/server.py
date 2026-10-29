@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -41,7 +42,54 @@ def _json_bytes(payload: Any) -> bytes:
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
+@dataclass(frozen=True)
+class OpenSubmission:
+    """What submit_open did: attached to a registered or pending database, or created an open job."""
+
+    session_id: str
+    job: Job | None
+    created: bool
+    session: Any | None
+
+
 def _build_managed_supervisor_class(upstream):
+    seat_phases = ("spawning", "opening", "registering")
+
+    def reason_text(exc: BaseException) -> str:
+        try:
+            return str(exc) or type(exc).__name__
+        except Exception:
+            return type(exc).__name__
+
+    def reuse_message(existing: str, requested: Any) -> str:
+        return (
+            f"Binary already open as session '{existing}', cannot reuse "
+            f"different session_id '{requested}'."
+        )
+
+    @dataclass(eq=False)
+    class PendingOpen:
+        """A database from submit_open until it registers or its failure path removes it."""
+
+        session_id: str
+        input_path: str
+        filename: str
+        candidates: set[str]
+        context_id: str | None
+        dispatcher: WorkerDispatcher
+        created_at: datetime = field(default_factory=datetime.now)
+        phase: str = "discovering"
+        worker: Any = None
+        claimed: bool = False
+        hook_set: bool = False
+        open_sent: bool = False
+        cancelled: bool = False
+        previous_bindings: dict[str, str | None] = field(default_factory=dict)
+        job: Job | None = None
+
+        def live(self) -> bool:
+            return not self.cancelled and self.job is not None and not self.job.is_done()
+
     class ManagedIdalibSupervisor(upstream.IdalibSupervisor):  # type: ignore[misc]
         RETIRED_TTL = 600.0
 
@@ -61,6 +109,10 @@ def _build_managed_supervisor_class(upstream):
             self._retired: list[tuple[str, str, WorkerDispatcher, float]] = []
             self._cancels = CancellationRegistry()
             self._job_local = threading.local()
+            self._pending: dict[str, PendingOpen] = {}
+            self._reopens: dict[str, dict[str, Any]] = {}
+            self._schema_spawning = False
+            self._schema_spawn_lock = threading.Lock()
             self._shut_down = False
             # OS-enforced backstop: workers assigned to this job are killed when
             # the supervisor process exits, so a hard kill never orphans them.
@@ -77,12 +129,16 @@ def _build_managed_supervisor_class(upstream):
             extensions = getattr(self.mcp._enabled_extensions, "data", None)
             mcp = self.mcp
             local = self._job_local
+            supervisor = self
 
             def run(job: Job) -> Any:
                 try:
                     local.session_id = job.session_id
                     mcp._transport_session_id.data = transport_session_id
                     mcp._enabled_extensions.data = set() if extensions is None else set(extensions)
+                    supervisor._guard_follower(job)
+                    if ensure_ready:
+                        supervisor._ensure_ready(job)
                     if job.cancel_requested:
                         raise CancelledError("Cancelled")
                     return body(job)
@@ -92,6 +148,24 @@ def _build_managed_supervisor_class(upstream):
                     mcp._enabled_extensions.data = set()
 
             return run
+
+        def _guard_follower(self, job: Job) -> None:
+            with self._lock:
+                record = self._pending.get(job.session_id)
+                if record is None or record.job is job:
+                    return
+            raise QueueClosedError(f"Database '{job.session_id}' did not open: Cancelled")
+
+        def _ensure_ready(self, job: Job) -> None:
+            with self._lock:
+                session = self.sessions.get(job.session_id)
+            if session is None or session.backend != "gui" or session.is_alive():
+                return
+            job.set_phase("reopening")
+            try:
+                self._reopen_gui_session_headless(session)
+            finally:
+                job.set_phase(None)
 
         def submit_job(
             self,
@@ -114,6 +188,502 @@ def _build_managed_supervisor_class(upstream):
                     ensure_ready = kind != "close"
                 wrapped = self._wrap_job_body(body, ensure_ready)
                 return dispatcher.submit(tool, json_rpc_id, args, wrapped, kind=kind)
+
+        # --- opening and seats ----------------------------------------------
+
+        def submit_open(
+            self,
+            input_path: str,
+            *,
+            run_auto_analysis: bool = True,
+            session_id: str | None = None,
+            context_id: str | None = None,
+            json_rpc_id: Any = None,
+        ) -> OpenSubmission:
+            resolved = self._normalize_input_path(input_path)
+            with self._lock:
+                if self._shut_down:
+                    raise QueueClosedError("Supervisor shutting down")
+                existing = self.path_to_session.get(self._path_key(resolved))
+                if existing is not None:
+                    session = self.sessions.get(existing)
+                    if session is not None and session.is_alive():
+                        if session_id is not None and session_id != existing:
+                            raise ValueError(reuse_message(existing, session_id))
+                        session.last_accessed = datetime.now()
+                        if context_id is not None:
+                            self.bind_context(context_id, existing)
+                        return OpenSubmission(existing, None, False, session)
+                    self._unregister_session_locked(existing)
+
+                candidates = self._candidate_idb_paths(resolved)
+                for record in self._pending.values():
+                    if record.live() and record.candidates & candidates:
+                        if session_id is not None and session_id != record.session_id:
+                            raise ValueError(reuse_message(record.session_id, session_id))
+                        if context_id is not None:
+                            self.bind_context(context_id, record.session_id)
+                        return OpenSubmission(record.session_id, record.job, False, None)
+
+                if session_id is None:
+                    session_id = str(uuid.uuid4())[:8]
+                    while session_id in self.sessions or session_id in self._pending:
+                        session_id = str(uuid.uuid4())[:8]
+                elif session_id in self.sessions or session_id in self._pending:
+                    raise ValueError(f"Session already exists: {session_id}")
+                dispatcher = WorkerDispatcher(session_id)
+                record = PendingOpen(
+                    session_id, resolved, Path(resolved).name, candidates, context_id, dispatcher
+                )
+                self._pending[session_id] = record
+                self._dispatchers[session_id] = dispatcher
+                args = {
+                    "input_path": resolved,
+                    "run_auto_analysis": run_auto_analysis,
+                    "session_id": session_id,
+                }
+                fn = self._open_job_fn(record, run_auto_analysis)
+                record.job = dispatcher.submit("idalib_open", json_rpc_id, args, fn, kind="open")
+                if context_id is not None:
+                    self.bind_context(context_id, session_id)
+                return OpenSubmission(session_id, record.job, True, None)
+
+        def open_session(self, input_path, *, run_auto_analysis=True, session_id=None, context_id=None):
+            if self._pinned_session() is not None:
+                raise RuntimeError("open_session called from a job body")
+            submission = self.submit_open(
+                input_path,
+                run_auto_analysis=run_auto_analysis,
+                session_id=session_id,
+                context_id=context_id,
+            )
+            job = submission.job
+            if job is None:
+                return submission.session
+            job.wait(None)
+            status = job.status
+            if status == "ok":
+                try:
+                    sid = job.result()["session_id"]
+                except LookupError:
+                    sid = submission.session_id
+                with self._lock:
+                    session = self.sessions.get(sid)
+                if session is None:
+                    raise RuntimeError(f"Session is stale or missing: {sid}")
+                return session
+            error = job.info().get("error")
+            if status == "error":
+                exception = job.exception()
+                if exception is not None:
+                    raise exception
+                raise QueueClosedError(error)
+            raise CancelledError(error or "Cancelled")
+
+        def _open_job_fn(self, record: PendingOpen, run_auto_analysis: bool) -> Callable[[Job], Any]:
+            """Return the open job's fn; its failure path covers the wrapper's own early exits too."""
+            outcome: dict[str, Any] = {
+                "registered": False,
+                "reason": "Cancelled",
+                "rebind_to": None,
+                "discard": False,
+            }
+            phases = self._wrap_job_body(
+                lambda job: self._run_open(record, job, run_auto_analysis, outcome), True
+            )
+
+            def run(job: Job) -> Any:
+                try:
+                    return phases(job)
+                except BaseException as exc:
+                    if isinstance(exc, CancelledError):
+                        outcome["reason"] = "Cancelled"
+                    elif isinstance(exc, Exception) and self._open_cancel_seen(record, job):
+                        outcome["reason"] = "Cancelled"
+                        raise CancelledError("Cancelled") from exc
+                    else:
+                        outcome["reason"] = reason_text(exc)
+                    raise
+                finally:
+                    if not outcome["registered"]:
+                        self._finish_failed_open(
+                            record,
+                            outcome["reason"],
+                            rebind_to=outcome["rebind_to"],
+                            discard=outcome["discard"],
+                        )
+
+            return run
+
+        def _run_open(
+            self, record: PendingOpen, job: Job, run_auto_analysis: bool, outcome: dict[str, Any]
+        ) -> Any:
+            sid = record.session_id
+            resolved = record.input_path
+            self._set_open_phase(record, job, "discovering")
+            instance = self._find_gui_instance_for_path(resolved)
+            if instance is not None:
+                session = self._make_gui_session(resolved, sid, instance)
+                self._set_open_phase(record, job, "registering")
+                return self._register_open(record, job, session, outcome)
+
+            with self._lock:
+                self._check_open_locked(record, job)
+                worker = self._take_schema_worker_for_session()
+                if worker is None:
+                    self._prune_dead_worker_sessions_locked()
+                    self._require_seat_locked()
+                else:
+                    record.worker = worker
+                    record.claimed = True
+                record.phase = "spawning"
+                job.set_phase("spawning")
+            if worker is None:
+                worker = self._start_worker_process()
+                with self._lock:
+                    record.worker = worker
+                    if self._shut_down:
+                        raise RuntimeError("Supervisor shutting down")
+                self._set_open_hook(record, job, worker)
+                self._wait_worker_ready(worker)
+
+            self._set_open_phase(record, job, "opening")
+            if record.claimed:
+                self._set_open_hook(record, job, worker)
+                with self._lock:
+                    self._check_open_locked(record, job)
+            record.open_sent = True
+            opened = self.call_worker_tool(
+                worker,
+                "idalib_open",
+                {"input_path": resolved, "run_auto_analysis": run_auto_analysis, "session_id": sid},
+            )
+            if isinstance(opened, dict) and opened.get("error"):
+                raise RuntimeError(str(opened["error"]))
+            worker_session = opened.get("session", {}) if isinstance(opened, dict) else {}
+            session = upstream.WorkerSession(
+                session_id=sid,
+                input_path=str(worker_session.get("input_path") or resolved),
+                filename=str(worker_session.get("filename") or Path(resolved).name),
+                is_analyzing=bool(worker_session.get("is_analyzing", False)),
+                metadata=dict(worker_session.get("metadata") or {}),
+                host=worker.host,
+                port=worker.port,
+                process=worker.process,
+                backend="worker",
+                owned=True,
+                pid=worker.process.pid if worker.process is not None else None,
+            )
+            self._set_open_phase(record, job, "registering")
+            return self._register_open(record, job, session, outcome)
+
+        def _register_open(self, record: PendingOpen, job: Job, session: Any, outcome: dict[str, Any]) -> Any:
+            sid = record.session_id
+            resolved = record.input_path
+            with self._lock:
+                self._check_open_locked(record, job)
+                existing = self.path_to_session.get(self._path_key(resolved))
+                current = None if existing is None else self.sessions.get(existing)
+                if current is not None and current.is_alive():
+                    current.last_accessed = datetime.now()
+                    outcome.update(
+                        rebind_to=existing, discard=True, reason=f"already open as session '{existing}'"
+                    )
+                    return self._open_result(current, record)
+                if existing is not None:
+                    self._unregister_session_locked(existing)
+                if self._pending.get(sid) is not record:
+                    raise RuntimeError(f"Pending open was removed: {sid}")
+                del self._pending[sid]
+                self._register_session_locked(session, resolved, None)
+                outcome["registered"] = True
+                return self._open_result(session, record)
+
+        def _open_result(self, session: Any, record: PendingOpen) -> dict[str, Any]:
+            return {
+                "session_id": session.session_id,
+                "session": session.to_dict(),
+                "context_id": record.context_id,
+            }
+
+        def _set_open_phase(self, record: PendingOpen, job: Job, phase: str) -> None:
+            with self._lock:
+                self._check_open_locked(record, job)
+                record.phase = phase
+                job.set_phase(phase)
+
+        def _set_open_hook(self, record: PendingOpen, job: Job, worker: Any) -> None:
+            record.hook_set = True
+            job.set_cancel_hook(lambda: self._terminate_worker(worker))
+
+        def _check_open_locked(self, record: PendingOpen, job: Job) -> None:
+            if self._shut_down:
+                raise RuntimeError("Supervisor shutting down")
+            if record.cancelled or job.cancel_requested:
+                raise CancelledError("Cancelled")
+
+        def _open_cancel_seen(self, record: PendingOpen, job: Job) -> bool:
+            with self._lock:
+                return record.cancelled or job.cancel_requested
+
+        def _require_seat_locked(self) -> None:
+            if self.max_workers > 0 and self.seats_in_use() >= self.max_workers:
+                raise RuntimeError(
+                    f"Maximum idalib worker count reached ({self.max_workers}). "
+                    "Close a database with idalib_close or increase --max-workers."
+                )
+
+        def _finish_failed_open(
+            self, record: PendingOpen, reason: str, *, rebind_to: str | None = None, discard: bool = False
+        ) -> None:
+            """Dispose of the open's worker, then remove its record, bindings and queue if still its own."""
+            try:
+                reusable = record.claimed and not record.open_sent and not record.hook_set
+                discard_as = record.session_id if discard else None
+                self._dispose_worker(record.worker, reusable=reusable, discard_as=discard_as)
+            finally:
+                sid = record.session_id
+                with self._lock:
+                    if self._pending.get(sid) is record:
+                        del self._pending[sid]
+                        for context, bound in list(self.context_bindings.items()):
+                            if bound != sid:
+                                continue
+                            previous = rebind_to
+                            if previous is None:
+                                previous = record.previous_bindings.get(context)
+                            if previous in self.sessions or self._is_live_pending(previous):
+                                self.context_bindings[context] = previous
+                            else:
+                                del self.context_bindings[context]
+                        dispatcher = record.dispatcher
+                        if self._dispatchers.get(sid) is dispatcher:
+                            del self._dispatchers[sid]
+                        self._prune_retired_locked()
+                        self._retired.append((sid, record.filename, dispatcher, time.monotonic()))
+                        dispatcher.close(f"Database '{sid}' did not open: {reason}")
+
+        def _is_live_pending(self, session_id: str) -> bool:
+            record = self._pending.get(session_id)
+            return record is not None and record.live()
+
+        def _dispose_worker(
+            self, worker: Any, *, reusable: bool = False, discard_as: str | None = None
+        ) -> None:
+            """Hand a reusable, alive worker back as the schema worker if that slot is free; else stop it."""
+            if worker is None:
+                return
+            try:
+                if reusable and worker.is_alive():
+                    with self._lock:
+                        slot = self._schema_worker
+                        if not self._shut_down and (slot is None or not slot.is_alive()):
+                            self._schema_worker = worker
+                            return
+                if discard_as is not None:
+                    self._discard_opened_worker_session(worker, discard_as)
+                else:
+                    self._terminate_worker(worker)
+            except Exception:
+                logger.exception("Could not stop worker pid %s", getattr(worker, "pid", None))
+
+        def seats_in_use(self) -> int:
+            with self._lock:
+                count = sum(
+                    1
+                    for session in self.sessions.values()
+                    if session.backend == "worker" and session.owned and session.is_alive()
+                )
+                count += sum(1 for record in self._pending.values() if record.phase in seat_phases)
+                count += len(self._reopens)
+                schema = self._schema_worker
+                if schema is not None and schema.is_alive():
+                    count += 1
+                if self._schema_spawning:
+                    count += 1
+                return count
+
+        def _schema_or_idle_worker(self):
+            if self._pinned_session() is not None:
+                raise RuntimeError("_schema_or_idle_worker called from a job body")
+            with self._lock:
+                worker = self._select_schema_worker_locked()
+            if worker is not None:
+                return worker
+            with self._schema_spawn_lock:
+                with self._lock:
+                    worker = self._select_schema_worker_locked()
+                    if worker is not None:
+                        return worker
+                    if self.max_workers > 0 and self.seats_in_use() >= self.max_workers:
+                        raise RuntimeError("No idle worker for tool discovery; all worker seats are in use")
+                    self._schema_spawning = True
+                try:
+                    spawned = self._spawn_worker()
+                    with self._lock:
+                        current = self._schema_worker
+                        if self._shut_down:
+                            result = None
+                        elif current is not None and current.is_alive():
+                            result = current
+                        else:
+                            self._schema_worker = spawned
+                            result = spawned
+                    if result is not spawned:
+                        self._dispose_worker(spawned)
+                finally:
+                    with self._lock:
+                        self._schema_spawning = False
+            if result is None:
+                raise RuntimeError("Supervisor shutting down")
+            return result
+
+        def _select_schema_worker_locked(self) -> Any:
+            usable = []
+            for session in self.sessions.values():
+                if session.backend != "worker" or not session.is_alive():
+                    continue
+                dispatcher = self._dispatchers.get(session.session_id)
+                if dispatcher is None or dispatcher.draining():
+                    continue
+                if dispatcher.current_job() is None and dispatcher.queued_count() == 0:
+                    return session
+                usable.append(session)
+            schema = self._schema_worker
+            if schema is not None and schema.is_alive():
+                return schema
+            return usable[0] if usable else None
+
+        def _reopen_gui_session_headless(self, session):
+            sid = session.session_id
+            if self._pinned_session() != sid:
+                return session
+            logger.info("GUI IDA backend for session %s is unavailable; reopening headless", sid)
+            resolved = self._resolve_gui_fallback_path(session)
+            mark: dict[str, Any] = {"worker": None}
+            worker = None
+            claimed = False
+            open_sent = False
+            settled = False
+            try:
+                with self._lock:
+                    if self._shut_down:
+                        raise RuntimeError("Supervisor shutting down")
+                    worker = self._take_schema_worker_for_session()
+                    if worker is None:
+                        self._prune_dead_worker_sessions_locked()
+                        self._require_seat_locked()
+                    else:
+                        claimed = True
+                        mark["worker"] = worker
+                    self._reopens[sid] = mark
+                if worker is None:
+                    worker = self._spawn_worker()
+                    with self._lock:
+                        mark["worker"] = worker
+                        if self._shut_down:
+                            raise RuntimeError("Supervisor shutting down")
+                open_sent = True
+                opened = self.call_worker_tool(
+                    worker,
+                    "idalib_open",
+                    {"input_path": resolved, "run_auto_analysis": False, "session_id": sid},
+                )
+                if isinstance(opened, dict) and opened.get("error"):
+                    raise RuntimeError(str(opened["error"]))
+                worker_session = opened.get("session", {}) if isinstance(opened, dict) else {}
+                replacement = upstream.WorkerSession(
+                    session_id=sid,
+                    input_path=str(worker_session.get("input_path") or resolved),
+                    filename=str(worker_session.get("filename") or Path(resolved).name),
+                    is_analyzing=bool(worker_session.get("is_analyzing", False)),
+                    metadata={
+                        **session.metadata,
+                        **dict(worker_session.get("metadata") or {}),
+                        "fallback_from_gui": True,
+                    },
+                    host=worker.host,
+                    port=worker.port,
+                    process=worker.process,
+                    backend="worker",
+                    owned=True,
+                    pid=worker.process.pid if worker.process is not None else None,
+                )
+                with self._lock:
+                    if self._reopens.get(sid) is mark:
+                        del self._reopens[sid]
+                    if self._shut_down:
+                        raise RuntimeError("Supervisor shutting down")
+                    current = self.sessions.get(sid)
+                    if current is session:
+                        self._register_session_locked(replacement, resolved, None)
+                        settled = True
+                        return replacement
+                    if current is not None and current.is_alive():
+                        current.last_accessed = datetime.now()
+                        kept = current
+                    else:
+                        if current is not None:
+                            self._unregister_session_locked(sid)
+                        kept = None
+                settled = True
+                self._dispose_worker(worker, discard_as=sid)
+                if kept is None:
+                    raise RuntimeError(f"Session '{sid}' was closed or replaced while reopening headlessly")
+                return kept
+            except BaseException:
+                if not settled:
+                    self._dispose_worker(worker, reusable=claimed and not open_sent)
+                raise
+            finally:
+                with self._lock:
+                    if self._reopens.get(sid) is mark:
+                        del self._reopens[sid]
+
+        def resolve_target(self, database: Any) -> str:
+            if self._pinned_session() is not None:
+                raise RuntimeError("resolve_target called from a job body")
+            with self._lock:
+                if database:
+                    records = self._pending_matches_locked(database)
+                    if len(records) > 1:
+                        raise RuntimeError(f"Database selector is ambiguous: {database}")
+                    if records:
+                        return records[0].session_id
+                else:
+                    bound = self._bound_session_locked()
+                    if bound is not None and bound in self._pending:
+                        return bound
+            return self.resolve_session(database).session_id
+
+        def _bound_session_locked(self) -> str | None:
+            context_id = self.resolve_context_id()
+            bound = self.context_bindings.get(context_id)
+            if bound is None and not self.isolated_contexts:
+                bound = self.context_bindings.get(upstream.SHARED_FALLBACK_CONTEXT_ID)
+            return bound
+
+        def _pending_matches_locked(self, database: Any) -> list[PendingOpen]:
+            """Match pending opens by id (any record), then live ones by path key, filename, input path."""
+            if not isinstance(database, str) or not self._pending:
+                return []
+            record = self._pending.get(database)
+            if record is not None:
+                return [record]
+            live = [record for record in self._pending.values() if record.live()]
+            try:
+                key = self._path_key(database)
+            except Exception:
+                key = os.path.normcase(database)
+            normalized = os.path.normcase(database)
+            for matches in (
+                [record for record in live if key in record.candidates],
+                [record for record in live if record.filename == database],
+                [record for record in live if os.path.normcase(record.input_path) == normalized],
+            ):
+                if matches:
+                    return matches
+            return []
 
         def _worker_rpc(self, worker, payload, *, timeout=None) -> dict[str, Any]:
             pinned = self._pinned_session()
@@ -153,6 +723,22 @@ def _build_managed_supervisor_class(upstream):
         def resolve_session(self, database=None):
             pinned = self._pinned_session()
             if pinned is None:
+                with self._lock:
+                    if database:
+                        records = [
+                            record for record in self._pending_matches_locked(database) if record.live()
+                        ]
+                    else:
+                        record = self._pending.get(self._bound_session_locked())
+                        records = [record] if record is not None and record.live() else []
+                    if len(records) > 1:
+                        raise RuntimeError(f"Database selector is ambiguous: {database}")
+                    if records:
+                        record = records[0]
+                        raise RuntimeError(
+                            f"Database '{record.session_id}' is still opening (job {record.job.id}, "
+                            f"{record.phase}); poll idalib_job_status(job_id=...)"
+                        )
                 return super().resolve_session(database)
             with self._lock:
                 session = self.sessions.get(pinned)
@@ -167,6 +753,9 @@ def _build_managed_supervisor_class(upstream):
             if self._pinned_session() is not None:
                 return
             with self._lock:
+                record = self._pending.get(session_id) if isinstance(session_id, str) else None
+                if record is not None and context_id not in record.previous_bindings:
+                    record.previous_bindings[context_id] = self.context_bindings.get(context_id)
                 super().bind_context(context_id, session_id)
 
         # --- registration, close, shutdown ----------------------------------
@@ -231,8 +820,16 @@ def _build_managed_supervisor_class(upstream):
                 self._shut_down = True
                 dispatchers = list(self._dispatchers.values())
                 self._dispatchers.clear()
+                records = list(self._pending.values())
+                self._pending.clear()
+                workers = [record.worker for record in records if record.worker is not None]
+                workers.extend(
+                    mark["worker"] for mark in self._reopens.values() if mark["worker"] is not None
+                )
             for dispatcher in dispatchers:
                 dispatcher.close("Supervisor shutting down")
+            for worker in workers:
+                self._dispose_worker(worker)
             super().shutdown()
 
         # --- job lookup and database state ----------------------------------
@@ -258,14 +855,35 @@ def _build_managed_supervisor_class(upstream):
             found = self._locate_job(job_id)
             if found is None:
                 return "unknown"
-            return found[1].cancel(job_id)
+            job, dispatcher = found
+            if job.kind != "open":
+                return dispatcher.cancel(job_id)
+            with self._lock:
+                record = next((record for record in self._pending.values() if record.job is job), None)
+                if record is None:
+                    return "finished"
+                flagged = not record.cancelled
+                record.cancelled = True
+            outcome = dispatcher.cancel(job_id)
+            if outcome == "removed":
+                self._finish_failed_open(record, "Cancelled")
+            elif outcome == "finished" and flagged and job.status == "cancelled":
+                return "cancelling"
+            return outcome
 
         def database_state(self, session_id: Any) -> str:
             with self._lock:
+                record = self._pending.get(session_id) if isinstance(session_id, str) else None
+                if record is not None:
+                    if record.dispatcher.draining():
+                        return "closing"
+                    return "spawning" if record.phase in ("discovering", "spawning") else "opening"
                 if isinstance(session_id, str) and session_id in self.sessions:
                     dispatcher = self._dispatchers.get(session_id)
                     if dispatcher is not None and dispatcher.draining():
                         return "closing"
+                    if session_id in self._reopens:
+                        return "reopening"
                     return "ready"
                 for retired_id, _filename, dispatcher, _retired_at in self._retired:
                     if retired_id == session_id and dispatcher.current_job() is not None:
@@ -312,7 +930,15 @@ def _build_managed_supervisor_class(upstream):
                         for sid in self.sessions
                         if sid in self._dispatchers
                     ]
+                    items.extend(
+                        self._pending_item_locked(record, recent) for record in self._pending.values()
+                    )
                     return items + self._retired_items_locked(None, recent)
+                records = self._pending_matches_locked(database)
+                if len(records) > 1:
+                    raise RuntimeError(f"Database selector is ambiguous: {database}")
+                if records:
+                    return [self._pending_item_locked(records[0], recent)]
                 matches = self._registered_matches_locked(database)
                 if len(matches) > 1:
                     raise RuntimeError(f"Database selector is ambiguous: {database}")
@@ -329,6 +955,14 @@ def _build_managed_supervisor_class(upstream):
                 "filename": self.sessions[sid].filename,
                 "state": self.database_state(sid),
                 **self._dispatchers[sid].jobs_info(recent=recent),
+            }
+
+        def _pending_item_locked(self, record: PendingOpen, recent: int) -> dict[str, Any]:
+            return {
+                "database": record.session_id,
+                "filename": record.filename,
+                "state": self.database_state(record.session_id),
+                **record.dispatcher.jobs_info(recent=recent),
             }
 
         def _retired_items_locked(self, database: str | None, recent: int) -> list[dict[str, Any]]:
@@ -356,7 +990,44 @@ def _build_managed_supervisor_class(upstream):
                         "queued_jobs": 0 if dispatcher is None else dispatcher.queued_count(),
                         "running_job": None if running is None else running.info(),
                     }
+                current = None if context_id is None else self.context_bindings.get(context_id)
+                counts: dict[str, int] = {}
+                for bound in self.context_bindings.values():
+                    counts[bound] = counts.get(bound, 0) + 1
+                entries.extend(
+                    self._pending_entry_locked(record, current, counts) for record in self._pending.values()
+                )
                 return entries
+
+        def _pending_entry_locked(
+            self, record: PendingOpen, current: str | None, counts: dict[str, int]
+        ) -> dict[str, Any]:
+            sid = record.session_id
+            worker = record.worker
+            process = None if worker is None else worker.process
+            pid = None if process is None else process.pid
+            created = record.created_at.isoformat()
+            running = record.dispatcher.current_job()
+            return {
+                "session_id": sid,
+                "input_path": record.input_path,
+                "filename": record.filename,
+                "created_at": created,
+                "last_accessed": created,
+                "is_analyzing": record.phase in ("opening", "registering"),
+                "metadata": {
+                    "state": self.database_state(sid),
+                    "queued_jobs": record.dispatcher.queued_count(),
+                    "running_job": None if running is None else running.info(),
+                },
+                "is_active": process is not None and process.poll() is None,
+                "is_current_context": current == sid,
+                "bound_contexts": counts.get(sid, 0),
+                "backend": "worker",
+                "owned": True,
+                "pid": pid,
+                "worker_pid": pid,
+            }
 
         # --- errors and worker processes ------------------------------------
 

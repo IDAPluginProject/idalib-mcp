@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import socket
 import tempfile
 import threading
 import time
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from fakeworker import FakeWorker, FakeWorkerFactory, make_supervisor, preserved_upstream
-from idalib_mcp.dispatcher import WorkerDispatcher
+from idalib_mcp.dispatcher import QueueClosedError, WorkerDispatcher
 from idalib_mcp.server import (
     _bound_instance_ui_url,
     _enable_path_database_auto_open,
@@ -382,7 +383,8 @@ class SupervisorQueueCoreTests(unittest.TestCase):
         self.assertIsInstance(job.exception(), RuntimeError)
         self.assertEqual(str(job.exception()), "Cross-database worker RPC from a job body")
         self.assertNotIn("echo", b_worker.call_names())
-        self.assertEqual(supervisor._dispatchers[b.session_id].jobs_info()["recent"], [])
+        b_jobs = supervisor._dispatchers[b.session_id].jobs_info()["recent"]
+        self.assertEqual([(j["tool"], j["kind"]) for j in b_jobs], [("idalib_open", "open")])
 
     def test_unregister_unknown_id_keeps_pending_dispatcher(self) -> None:
         pending = WorkerDispatcher("pending-id")
@@ -478,7 +480,7 @@ class SupervisorQueueCoreTests(unittest.TestCase):
         )
         self.assertEqual(
             [(j["tool"], j["kind"], j["status"]) for j in databases[0]["recent"]],
-            [("idalib_close", "close", "ok"), ("echo", "tool", "ok")],
+            [("idalib_close", "close", "ok"), ("echo", "tool", "ok"), ("idalib_open", "open", "ok")],
         )
         self.assertEqual(worker.call_names()[-1], "idalib_close")
         self.assertEqual(worker.process.poll(), -9)
@@ -486,6 +488,463 @@ class SupervisorQueueCoreTests(unittest.TestCase):
             self.supervisor.submit_job(sid, "echo", 2, {}, self._tool_body("echo", {}))
         self.assertFalse(self.supervisor.close_session(sid))
         self.assertEqual(self.supervisor.list_sessions(None), [])
+
+
+def _closed_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+_LIST_KEYS = [
+    "session_id",
+    "input_path",
+    "filename",
+    "created_at",
+    "last_accessed",
+    "is_analyzing",
+    "metadata",
+    "is_active",
+    "is_current_context",
+    "bound_contexts",
+    "backend",
+    "owned",
+    "pid",
+    "worker_pid",
+]
+_MAX_TEXT = (
+    "Maximum idalib worker count reached (1). "
+    "Close a database with idalib_close or increase --max-workers."
+)
+
+
+class SupervisorOpenPipelineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.temp_path = Path(temp_dir.name)
+        self.upstream = importlib.import_module("ida_pro_mcp.idalib_supervisor")
+        self.ctx = self.upstream.SHARED_FALLBACK_CONTEXT_ID
+
+    def _make(self, max_workers: int = 4, **factory_kwargs: Any) -> tuple[Any, FakeWorkerFactory]:
+        factory = FakeWorkerFactory(self.upstream, **factory_kwargs)
+        supervisor = make_supervisor(self, self.upstream, factory, max_workers=max_workers, sync_wait=0.1)
+        wait_ready = supervisor._wait_worker_ready
+        supervisor._wait_worker_ready = lambda worker, timeout=_WAIT: wait_ready(worker, timeout=_WAIT)
+        return supervisor, factory
+
+    def _path(self, name: str) -> str:
+        path = self.temp_path / name
+        path.write_bytes(b"MZ")
+        return str(path.resolve())
+
+    def _worker_of(self, factory: FakeWorkerFactory, session: Any) -> FakeWorker:
+        return next(worker for worker in factory.workers if worker.port == session.port)
+
+    def _opening(self, factory: FakeWorkerFactory) -> bool:
+        return bool(factory.workers) and "idalib_open" in factory.workers[-1].call_names()
+
+    def _held_gate(self) -> threading.Event:
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        return gate
+
+    def test_opening_database_listed_as_opening(self) -> None:
+        gate = threading.Event()
+        supervisor, factory = self._make(open_gate=gate)
+        self.addCleanup(gate.set)
+        path = self._path("a.exe")
+        submission = supervisor.submit_open(path, context_id=self.ctx)
+        sid = submission.session_id
+        self.assertTrue(_wait_until(lambda: self._opening(factory)))
+        request = {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "idalib_list", "arguments": {}},
+        }
+        with preserved_upstream(self.upstream):
+            self.upstream.supervisor = supervisor
+            started = time.monotonic()
+            listing = self.upstream._original_dispatch(request)["result"]["structuredContent"]
+            self.assertLess(time.monotonic() - started, 1.0)
+
+            self.assertEqual((listing["count"], listing["current_context_session_id"]), (1, sid))
+            entry = listing["sessions"][0]
+            self.assertEqual(list(entry), _LIST_KEYS)
+            identity = (entry["session_id"], entry["input_path"], entry["filename"])
+            self.assertEqual(identity, (sid, path, "a.exe"))
+            self.assertEqual(entry["created_at"], entry["last_accessed"])
+            self.assertEqual(entry["metadata"]["state"], "opening")
+            self.assertEqual(entry["metadata"]["queued_jobs"], 0)
+            self.assertEqual(entry["metadata"]["running_job"]["job_id"], submission.job.id)
+            self.assertEqual(entry["metadata"]["running_job"]["phase"], "opening")
+            pid = factory.workers[0].process.pid
+            flag_keys = ("is_analyzing", "is_active", "is_current_context", "bound_contexts")
+            flags = [entry[key] for key in flag_keys]
+            self.assertEqual(flags, [True, True, True, 1])
+            owner = [entry[key] for key in ("backend", "owned", "pid", "worker_pid")]
+            self.assertEqual(owner, ["worker", True, pid, pid])
+
+            gate.set()
+            self.assertTrue(submission.job.wait(_WAIT))
+            listing = self.upstream._original_dispatch(request)["result"]["structuredContent"]
+            entry = listing["sessions"][0]
+            self.assertEqual(list(entry), _LIST_KEYS)
+            self.assertEqual((entry["session_id"], entry["metadata"]["state"]), (sid, "ready"))
+
+    def test_concurrent_opens_of_one_path_spawn_one_worker(self) -> None:
+        gate = threading.Event()
+        supervisor, factory = self._make(spawn_gate=gate)
+        self.addCleanup(gate.set)
+        path = self._path("a.exe")
+        idb = self._path("a.exe.i64")
+        barrier = threading.Barrier(2)
+        results: list[Any] = []
+
+        def submit() -> None:
+            barrier.wait(_WAIT)
+            results.append(supervisor.submit_open(path, context_id=self.ctx))
+
+        threads = [threading.Thread(target=submit, daemon=True) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(_WAIT)
+            self.assertFalse(thread.is_alive())
+        by_idb = supervisor.submit_open(idb, context_id="other")
+        self.assertTrue(_wait_until(lambda: len(factory.spawn_threads) == 1))
+        gate.set()
+
+        job = results[0].job
+        self.assertTrue(job.wait(_WAIT))
+        self.assertEqual(job.status, "ok")
+        self.assertEqual(sorted(result.created for result in results), [False, True])
+        self.assertFalse(by_idb.created)
+        self.assertEqual({result.session_id for result in [*results, by_idb]}, {job.session_id})
+        self.assertTrue(all(result.job is job for result in [*results, by_idb]))
+        self.assertEqual((len(factory.spawn_threads), len(factory.workers)), (1, 1))
+        again = supervisor.submit_open(idb)
+        self.assertEqual((again.session_id, again.job, again.created), (job.session_id, None, False))
+        self.assertIs(again.session, supervisor.sessions[job.session_id])
+
+    def test_spawning_open_counts_against_max_workers(self) -> None:
+        gate = threading.Event()
+        supervisor, factory = self._make(max_workers=1, spawn_gate=gate)
+        self.addCleanup(gate.set)
+        a = supervisor.submit_open(self._path("a.exe"), context_id=self.ctx)
+        self.assertTrue(_wait_until(lambda: len(factory.spawn_threads) == 1))
+        self.assertEqual(supervisor.database_state(a.session_id), "spawning")
+        self.assertEqual(supervisor.seats_in_use(), 1)
+
+        with self.assertLogs("idalib_mcp.dispatcher", level="ERROR"):
+            b = supervisor.submit_open(self._path("b.exe"), context_id="ctx-b")
+            self.assertTrue(b.job.wait(_WAIT))
+        self.assertEqual((b.job.status, b.job.info()["error"]), ("error", _MAX_TEXT))
+        self.assertEqual(len(factory.spawn_threads), 1)
+        self.assertEqual(supervisor.database_state(b.session_id), "closed")
+        self.assertNotIn(b.session_id, supervisor._dispatchers)
+        self.assertNotIn("ctx-b", supervisor.context_bindings)
+
+        gate.set()
+        self.assertTrue(a.job.wait(_WAIT))
+        self.assertEqual(a.job.status, "ok")
+        self.assertEqual(supervisor.database_state(a.session_id), "ready")
+        self.assertEqual(supervisor.seats_in_use(), 1)
+
+    def test_cancel_open_terminates_worker_and_frees_seat(self) -> None:
+        gate = threading.Event()
+        supervisor, factory = self._make(max_workers=1, open_gate=gate)
+        self.addCleanup(gate.set)
+        a = supervisor.submit_open(self._path("a.exe"), context_id=self.ctx)
+        sid = a.session_id
+        follower = supervisor.submit_job(sid, "echo", 2, {}, lambda _job: "never")
+        self.assertTrue(_wait_until(lambda: self._opening(factory)))
+        worker = factory.workers[0]
+        self.assertEqual(supervisor.database_state(sid), "opening")
+        self.assertEqual(supervisor.seats_in_use(), 1)
+
+        self.assertEqual(supervisor.cancel_job(a.job.id), "cancelling")
+        self.assertTrue(a.job.wait(_WAIT))
+        self.assertTrue(follower.wait(_WAIT))
+
+        self.assertEqual((a.job.status, a.job.info()["error"]), ("cancelled", "Cancelled"))
+        self.assertEqual(worker.process.poll(), -9)
+        expected = ("error", f"Database '{sid}' did not open: Cancelled")
+        self.assertEqual((follower.status, follower.info()["error"]), expected)
+        self.assertEqual(supervisor.seats_in_use(), 0)
+        self.assertNotIn(sid, supervisor._dispatchers)
+        self.assertNotIn(self.ctx, supervisor.context_bindings)
+        self.assertEqual(supervisor.database_state(sid), "closed")
+        self.assertEqual(supervisor.cancel_job(a.job.id), "finished")
+
+        gate.set()
+        b = supervisor.open_session(self._path("b.exe"), context_id=self.ctx)
+        self.assertTrue(b.is_alive())
+        self.assertEqual(len(factory.workers), 2)
+
+    def test_dead_gui_session_reopens_on_executor_only(self) -> None:
+        gate = threading.Event()
+        supervisor, factory = self._make(spawn_gate=gate)
+        self.addCleanup(gate.set)
+        path = self._path("gui.exe")
+        instance = {"host": "127.0.0.1", "port": _closed_port(), "pid": 4242, "idb_path": path}
+        supervisor._find_gui_instance_for_path = lambda resolved_path: instance
+        gui = supervisor.open_session(path, context_id=self.ctx)
+        sid = gui.session_id
+        self.assertEqual((gui.backend, gui.pid), ("gui", 4242))
+        self.assertIs(supervisor.resolve_session(sid), gui)
+        self.assertEqual(supervisor.resolve_target(sid), sid)
+        self.assertEqual(factory.spawn_threads, [])
+
+        def body(_job: Any) -> Any:
+            return supervisor.call_worker_tool(supervisor.resolve_session(), "echo", {"x": 1})
+
+        job = supervisor.submit_job(sid, "echo", 1, {"x": 1}, body)
+        self.assertTrue(_wait_until(lambda: len(factory.spawn_threads) == 1))
+        self.assertEqual(factory.spawn_threads, [f"queue-{sid}"])
+        self.assertEqual(supervisor.database_state(sid), "reopening")
+        self.assertEqual(job.info()["phase"], "reopening")
+        self.assertEqual(supervisor.seats_in_use(), 1)
+        self.assertEqual(supervisor.list_sessions(None)[0]["metadata"]["state"], "reopening")
+
+        gate.set()
+        self.assertTrue(job.wait(_WAIT))
+        self.assertEqual(job.status, "ok")
+        self.assertEqual(job.result(), {"tool": "echo", "arguments": {"x": 1}})
+        replacement = supervisor.sessions[sid]
+        self.assertEqual((replacement.backend, replacement.metadata.get("fallback_from_gui")), ("worker", True))
+        worker = self._worker_of(factory, replacement)
+        self.assertEqual(worker.call_names(), ["ping", "idalib_open", "echo"])
+        self.assertIs(worker.calls()[1].arguments["run_auto_analysis"], False)
+        self.assertEqual(factory.spawn_threads, [f"queue-{sid}"])
+        self.assertEqual(supervisor.database_state(sid), "ready")
+        self.assertEqual(supervisor.seats_in_use(), 1)
+
+    def test_gui_open_succeeds_at_seat_limit(self) -> None:
+        supervisor, factory = self._make(max_workers=1)
+        supervisor.open_session(self._path("a.exe"), context_id=self.ctx)
+        gui_path = self._path("gui.exe")
+        gui_worker = FakeWorker()
+        gui_worker.start()
+        self.addCleanup(gui_worker.kill)
+        instance = {"host": gui_worker.host, "port": gui_worker.port, "pid": 4242, "idb_path": gui_path}
+        supervisor._find_gui_instance_for_path = lambda resolved_path: (
+            instance if resolved_path == gui_path else None
+        )
+        self.assertEqual(supervisor.seats_in_use(), 1)
+
+        gui = supervisor.open_session(gui_path, context_id=self.ctx)
+
+        self.assertEqual((gui.backend, gui.port, gui.pid), ("gui", gui_worker.port, 4242))
+        self.assertIs(supervisor.sessions[gui.session_id], gui)
+        self.assertEqual(supervisor.context_bindings[self.ctx], gui.session_id)
+        self.assertEqual((len(factory.spawn_threads), supervisor.seats_in_use()), (1, 1))
+        with self.assertLogs("idalib_mcp.dispatcher", level="ERROR"):
+            with self.assertRaises(RuntimeError) as caught:
+                supervisor.open_session(self._path("c.exe"), context_id=self.ctx)
+        self.assertEqual(str(caught.exception), _MAX_TEXT)
+
+    def test_cancel_racing_open_registration(self) -> None:
+        supervisor, factory = self._make()
+        register = supervisor._register_session_locked
+        outcomes: list[str] = []
+        cancellers: list[threading.Thread] = []
+
+        def racing_register(session: Any, resolved_path: str, context_id: Any) -> None:
+            job = supervisor._dispatchers[session.session_id].current_job()
+            canceller = threading.Thread(
+                target=lambda: outcomes.append(supervisor.cancel_job(job.id)), daemon=True
+            )
+            cancellers.append(canceller)
+            canceller.start()
+            canceller.join(0.2)
+            self.assertTrue(canceller.is_alive())
+            register(session, resolved_path, context_id)
+
+        supervisor._register_session_locked = racing_register
+        submission = supervisor.submit_open(self._path("a.exe"), context_id=self.ctx)
+        self.assertTrue(submission.job.wait(_WAIT))
+        cancellers[0].join(_WAIT)
+        self.assertFalse(cancellers[0].is_alive())
+
+        sid = submission.session_id
+        self.assertEqual(outcomes, ["finished"])
+        self.assertEqual(submission.job.status, "ok")
+        self.assertTrue(supervisor.sessions[sid].is_alive())
+        self.assertIsNone(factory.workers[0].process.poll())
+        self.assertEqual(supervisor.database_state(sid), "ready")
+        self.assertEqual(supervisor.context_bindings[self.ctx], sid)
+
+    def test_open_after_failed_spawn_spawns_again(self) -> None:
+        supervisor, factory = self._make()
+        attempts: list[int] = []
+
+        def flaky_start() -> Any:
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise OSError("spawn failed")
+            return factory()
+
+        supervisor._start_worker_process = flaky_start
+        path = self._path("a.exe")
+        with self.assertLogs("idalib_mcp.dispatcher", level="ERROR"):
+            with self.assertRaises(OSError) as caught:
+                supervisor.open_session(path, context_id=self.ctx)
+        self.assertEqual(str(caught.exception), "spawn failed")
+        self.assertEqual((supervisor._pending, supervisor._dispatchers), ({}, {}))
+        self.assertEqual(supervisor.seats_in_use(), 0)
+        self.assertNotIn(self.ctx, supervisor.context_bindings)
+
+        session = supervisor.open_session(path, context_id=self.ctx)
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(factory.workers), 1)
+        self.assertTrue(session.is_alive())
+        self.assertEqual(supervisor._pending, {})
+        self.assertEqual(list(supervisor._dispatchers), [session.session_id])
+        self.assertEqual(supervisor.context_bindings[self.ctx], session.session_id)
+
+    def test_failed_open_restores_previous_binding(self) -> None:
+        supervisor, factory = self._make(max_workers=1)
+        a = supervisor.open_session(self._path("a.exe"), context_id=self.ctx)
+        path_b = self._path("b.exe")
+        hold = self._held_gate()
+
+        def discover(resolved_path: str) -> None:
+            if resolved_path == path_b:
+                hold.wait(_WAIT)
+            return None
+
+        supervisor._find_gui_instance_for_path = discover
+        b = supervisor.submit_open(path_b, context_id=self.ctx)
+        other = supervisor.submit_open(path_b, context_id="other")
+        self.assertEqual((other.session_id, other.created), (b.session_id, False))
+        self.assertEqual(supervisor.context_bindings[self.ctx], b.session_id)
+        self.assertEqual(supervisor.context_bindings["other"], b.session_id)
+
+        with self.assertLogs("idalib_mcp.dispatcher", level="ERROR"):
+            hold.set()
+            self.assertTrue(b.job.wait(_WAIT))
+
+        self.assertEqual((b.job.status, b.job.info()["error"]), ("error", _MAX_TEXT))
+        self.assertEqual(supervisor.context_bindings[self.ctx], a.session_id)
+        self.assertNotIn("other", supervisor.context_bindings)
+        self.assertEqual(len(factory.workers), 1)
+
+    def test_cancel_flag_then_registering_reports_cancelling(self) -> None:
+        gate = threading.Event()
+        supervisor, factory = self._make(open_gate=gate)
+        self.addCleanup(gate.set)
+        submission = supervisor.submit_open(self._path("a.exe"), context_id=self.ctx)
+        sid = submission.session_id
+        self.assertTrue(_wait_until(lambda: self._opening(factory)))
+        worker = factory.workers[0]
+        dispatcher = supervisor._dispatchers[sid]
+        real_cancel = dispatcher.cancel
+
+        def late_cancel(job_id: str) -> str:
+            gate.set()
+            submission.job.wait(_WAIT)
+            return real_cancel(job_id)
+
+        dispatcher.cancel = late_cancel
+
+        self.assertEqual(supervisor.cancel_job(submission.job.id), "cancelling")
+        self.assertEqual(submission.job.status, "cancelled")
+        self.assertEqual(worker.process.poll(), -9)
+        self.assertNotIn(sid, supervisor.sessions)
+        self.assertNotIn(sid, supervisor._dispatchers)
+        self.assertEqual(supervisor.seats_in_use(), 0)
+
+    def test_shutdown_during_spawn_leaves_no_registered_session(self) -> None:
+        gate = threading.Event()
+        supervisor, factory = self._make(spawn_gate=gate)
+        self.addCleanup(gate.set)
+        submission = supervisor.submit_open(self._path("a.exe"), context_id=self.ctx)
+        self.assertTrue(_wait_until(lambda: len(factory.spawn_threads) == 1))
+
+        supervisor.shutdown()
+        self.assertEqual((supervisor._pending, supervisor._dispatchers), ({}, {}))
+        with self.assertLogs("idalib_mcp.dispatcher", level="ERROR"):
+            gate.set()
+            self.assertTrue(submission.job.wait(_WAIT))
+
+        expected = ("error", "Supervisor shutting down")
+        self.assertEqual((submission.job.status, submission.job.info()["error"]), expected)
+        self.assertEqual(supervisor.sessions, {})
+        self.assertEqual(len(factory.workers), 1)
+        self.assertEqual(factory.workers[0].process.poll(), -9)
+        self.assertEqual(supervisor.seats_in_use(), 0)
+        with self.assertRaises(QueueClosedError):
+            supervisor.submit_open(self._path("b.exe"))
+        self.assertFalse(supervisor.close_session(submission.session_id))
+
+    def test_cold_tools_list_spawns_one_schema_worker(self) -> None:
+        gate = threading.Event()
+        supervisor, factory = self._make(spawn_gate=gate)
+        self.addCleanup(gate.set)
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        responses: list[Any] = []
+        with preserved_upstream(self.upstream):
+            self.upstream.supervisor = supervisor
+            callers = [
+                threading.Thread(
+                    target=lambda: responses.append(self.upstream._handle_tools_list(request)), daemon=True
+                )
+                for _ in range(2)
+            ]
+            for caller in callers:
+                caller.start()
+            self.assertTrue(_wait_until(lambda: len(factory.spawn_threads) == 1))
+            seats: list[int] = []
+            helper = threading.Thread(target=lambda: seats.append(supervisor.seats_in_use()), daemon=True)
+            helper.start()
+            helper.join(1.0)
+            self.assertFalse(helper.is_alive())
+            self.assertEqual(seats, [1])
+
+            gate.set()
+            for caller in callers:
+                caller.join(_WAIT)
+                self.assertFalse(caller.is_alive())
+            self.assertEqual(len(factory.workers), 1)
+            self.assertEqual(supervisor._schema_worker.port, factory.workers[0].port)
+            self.assertEqual(len(responses), 2)
+            for response in responses:
+                names = [tool["name"] for tool in response["result"]["tools"]]
+                self.assertIn("slow_tool", names)
+                self.assertIn("echo", names)
+
+    def test_schema_spawn_keeps_handed_back_worker(self) -> None:
+        supervisor, factory = self._make()
+        handed_back = factory()
+        gate = threading.Event()
+        factory.spawn_gate = gate
+        self.addCleanup(gate.set)
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        responses: list[Any] = []
+        with preserved_upstream(self.upstream):
+            self.upstream.supervisor = supervisor
+            caller = threading.Thread(
+                target=lambda: responses.append(self.upstream._handle_tools_list(request)), daemon=True
+            )
+            caller.start()
+            self.assertTrue(_wait_until(lambda: len(factory.spawn_threads) == 2))
+            with supervisor._lock:
+                supervisor._schema_worker = handed_back
+
+            gate.set()
+            caller.join(_WAIT)
+            self.assertFalse(caller.is_alive())
+            self.assertIs(supervisor._schema_worker, handed_back)
+            spawned = factory.workers[1]
+            self.assertTrue(_wait_until(lambda: spawned.process.poll() == -9))
+            registered = {session.port for session in supervisor.sessions.values()}
+            alive = [worker for worker in factory.workers if worker.process.poll() is None]
+            tracked = {handed_back.port, *registered}
+            self.assertTrue(all(worker.port in tracked for worker in alive))
+            self.assertIn("echo", [tool["name"] for tool in responses[0]["result"]["tools"]])
 
 
 class OpenUiToolTests(unittest.TestCase):
