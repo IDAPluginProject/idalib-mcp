@@ -1156,30 +1156,15 @@ def _build_managed_supervisor_class(upstream):
 
 
 def _snapshot_instances(supervisor: Any) -> dict[str, Any]:
-    with supervisor._lock:
-        binding_counts: dict[str, int] = {}
-        for session_id in supervisor.context_bindings.values():
-            binding_counts[session_id] = binding_counts.get(session_id, 0) + 1
-
-        sessions = [
-            session.to_list_dict(current=False, bound_contexts=binding_counts.get(session.session_id, 0))
-            for session in supervisor.sessions.values()
-        ]
-
-        owned_workers = sum(
-            1
-            for session in supervisor.sessions.values()
-            if session.backend == "worker" and session.owned and session.is_alive()
-        )
-
-        return {
-            "sessions": sessions,
-            "count": len(sessions),
-            "owned_workers": owned_workers,
-            "max_workers": supervisor.max_workers,
-            "isolated_contexts": supervisor.isolated_contexts,
-            "ida_home": str(supervisor.ida_home) if getattr(supervisor, "ida_home", None) else None,
-        }
+    entries = supervisor.list_sessions(None)
+    return {
+        "sessions": entries,
+        "count": len(entries),
+        "owned_workers": supervisor.seats_in_use(),
+        "max_workers": supervisor.max_workers,
+        "isolated_contexts": supervisor.isolated_contexts,
+        "ida_home": str(supervisor.ida_home) if getattr(supervisor, "ida_home", None) else None,
+    }
 
 
 def _save_session_before_close(supervisor: Any, session_id: str) -> dict[str, Any]:
@@ -1192,6 +1177,31 @@ def _save_session_before_close(supervisor: Any, session_id: str) -> dict[str, An
         error = result.get("error") or "Save failed"
         raise RuntimeError(str(error))
     return result
+
+
+def _ui_close_outcome(supervisor: Any, session_id: str, save: bool) -> tuple[int, dict[str, Any]]:
+    """Save (if asked) and close on the database's job thread; returns the UI's (status, JSON body)."""
+    save_result = None
+    if save:
+        try:
+            save_result = _save_session_before_close(supervisor, session_id)
+        except KeyError:
+            return 404, {"success": False, "error": f"Session not found: {session_id}"}
+        except Exception as exc:
+            logger.warning("UI save before close failed for %s", session_id, exc_info=True)
+            return 500, {"success": False, "saved": False, "error": f"Save failed: {exc}"}
+    try:
+        closed = supervisor.close_session(session_id)
+    except Exception as exc:
+        logger.warning("UI close failed for %s", session_id, exc_info=True)
+        return 500, {"success": False, "error": str(exc)}
+    return (200 if closed else 404), {
+        "success": bool(closed),
+        "saved": bool(save_result),
+        "save_result": save_result,
+        "message": f"Session closed: {session_id}" if closed else None,
+        "error": None if closed else f"Session not found: {session_id}",
+    }
 
 
 def _build_request_handler(upstream):
@@ -1280,41 +1290,66 @@ def _build_request_handler(upstream):
                 supervisor = self._supervisor()
                 options = self._read_json_body()
                 save_requested = bool(options.get("save"))
-                save_result = None
-                if save_requested:
-                    try:
-                        save_result = _save_session_before_close(supervisor, session_id)
-                    except KeyError:
-                        self._send_json(404, {"success": False, "error": f"Session not found: {session_id}"})
-                        return
-                    except Exception as exc:
-                        self._send_json(
-                            500,
-                            {
-                                "success": False,
-                                "saved": False,
-                                "error": f"Save failed: {exc}",
-                            },
-                        )
-                        return
-                try:
-                    closed = supervisor.close_session(session_id)
-                except Exception as exc:
-                    self._send_json(500, {"success": False, "error": str(exc)})
-                    return
-                status = 200 if closed else 404
+                self._close_via_job(supervisor, session_id, save_requested)
+                return
+            super().do_POST()
+
+        def _close_via_job(self, supervisor, session_id: str, save: bool) -> None:
+            holder: list[tuple[int, dict[str, Any]]] = []
+
+            def body(_job: Job) -> Any:
+                status, payload = _ui_close_outcome(supervisor, session_id, save)
+                holder.append((status, payload))
+                return upstream._jsonrpc_result(None, upstream._call_tool_result(payload))
+
+            try:
+                job = supervisor.submit_job(
+                    session_id,
+                    "ui_close",
+                    None,
+                    {"session_id": session_id, "save": save},
+                    body,
+                    kind="close",
+                    ensure_ready=save,
+                )
+            except QueueClosedError as exc:
+                self._send_json(500, {"success": False, "error": str(exc)})
+                return
+            except LookupError as exc:
+                if save:
+                    self._send_json(500, {"success": False, "saved": False, "error": f"Save failed: {exc}"})
+                else:
+                    self._send_json(
+                        404,
+                        {
+                            "success": False,
+                            "saved": False,
+                            "save_result": None,
+                            "message": None,
+                            "error": f"Session not found: {session_id}",
+                        },
+                    )
+                return
+            if wait_for_job(job, supervisor.sync_wait) != "done":
                 self._send_json(
-                    status,
+                    202,
                     {
-                        "success": bool(closed),
-                        "saved": bool(save_result),
-                        "save_result": save_result,
-                        "message": f"Session closed: {session_id}" if closed else None,
-                        "error": None if closed else f"Session not found: {session_id}",
+                        "success": True,
+                        "pending": True,
+                        "job_id": job.id,
+                        "message": (
+                            f"Closing {session_id} is still running in the background; "
+                            f"poll idalib_job_status(job_id={job.id!r})."
+                        ),
                     },
                 )
                 return
-            super().do_POST()
+            if job.status == "ok" and holder:
+                status, payload = holder[0]
+                self._send_json(status, payload)
+                return
+            failure = json.loads(render_job_failed(job.info())["content"][0]["text"])["error"]
+            self._send_json(500, {"success": False, "error": failure})
 
         def _supervisor(self):
             if upstream.supervisor is None:
@@ -1593,6 +1628,16 @@ def _build_request_handler(upstream):
       return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
     }
 
+    function stateLabel(session) {
+      const meta = session.metadata || {};
+      let label = meta.state || (session.is_active ? 'running' : 'stopped');
+      if (label === 'ready' && !session.is_active) label = 'stopped';
+      const details = [];
+      if (meta.running_job) details.push(`${meta.running_job.tool} running`);
+      if (meta.queued_jobs > 0) details.push(`${meta.queued_jobs} queued`);
+      return escapeHtml(details.length ? `${label} (${details.join(', ')})` : label);
+    }
+
     function sessionRow(session) {
       const tr = document.createElement('tr');
       const activeClass = session.is_active ? 'pill ok' : 'pill';
@@ -1603,7 +1648,7 @@ def _build_request_handler(upstream):
         <td>${escapeHtml(session.filename)}</td>
         <td>${escapeHtml(session.backend)}</td>
         <td>${escapeHtml(session.pid ?? session.worker_pid)}</td>
-        <td><span class="${activeClass}">${session.is_active ? 'running' : 'stopped'}</span></td>
+        <td><span class="${activeClass}">${stateLabel(session)}</span></td>
         <td>${escapeHtml(session.bound_contexts)}</td>
         <td>${escapeHtml(fmtTime(session.last_accessed))}</td>
         <td class="path" title="${inputPath}">${inputPath}</td>
