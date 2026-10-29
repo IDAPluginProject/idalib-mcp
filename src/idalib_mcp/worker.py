@@ -18,7 +18,13 @@ def split_worker_args(argv: list[str]) -> tuple[Path | None, Path | None, list[s
 
 
 def main() -> None:
-    ida_home, config_root, remaining = split_worker_args(sys.argv[1:])
+    # Consume --supervisor-pid (added by the managed supervisor) before any
+    # other parsing so it is not forwarded to the upstream idalib_server parser.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--supervisor-pid", type=int, default=None)
+    pre_args, argv = pre.parse_known_args(sys.argv[1:])
+
+    ida_home, config_root, remaining = split_worker_args(argv)
 
     try:
         configure_idalib_environment(ida_home, config_root=config_root)
@@ -52,6 +58,15 @@ def main() -> None:
         MCP_SERVER.tools.methods.pop(_name, None)
 
     os.environ.setdefault("IDA_MCP_WORKER", "1")
+
+    # Shut down cleanly if the supervisor goes away (e.g. is hard-killed),
+    # instead of lingering as an orphan that holds an IDA license seat. The
+    # upstream main() registers the SIGTERM handler that this watchdog triggers.
+    if pre_args.supervisor_pid is not None:
+        from .parentwatch import start_parent_death_watch
+
+        start_parent_death_watch(pre_args.supervisor_pid)
+
     upstream_server.main()
 
 

@@ -19,6 +19,7 @@ from .cancellation import CancellationRegistry
 from .config import default_ida_home_from_env, validate_ida_home
 from .dispatcher import CancelledError, WorkerDispatcher
 from .installer import list_available_clients, print_mcp_config, run_install_command
+from .winjob import assign_process_to_job, create_kill_on_close_job
 
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,9 @@ def _build_managed_supervisor_class(upstream):
             self.show_worker_io = show_worker_io
             self._dispatchers: dict[str, WorkerDispatcher] = {}
             self._cancels = CancellationRegistry()
+            # OS-enforced backstop: workers assigned to this job are killed when
+            # the supervisor process exits, so a hard kill never orphans them.
+            self._worker_job = create_kill_on_close_job()
 
         def get_or_create_dispatcher(self, session_id: str) -> WorkerDispatcher:
             with self._lock:
@@ -188,6 +192,8 @@ def _build_managed_supervisor_class(upstream):
             ]
             if self.ida_home is not None:
                 cmd.extend(["--ida-home", str(self.ida_home)])
+            # Let the worker watch us and shut down cleanly if we disappear.
+            cmd.extend(["--supervisor-pid", str(os.getpid())])
             cmd.extend(
                 [
                     "--host",
@@ -206,6 +212,14 @@ def _build_managed_supervisor_class(upstream):
                 stderr=None if self.show_worker_io else subprocess.DEVNULL,
                 env=os.environ.copy(),
             )
+            if self._worker_job is not None and not assign_process_to_job(
+                self._worker_job, process
+            ):
+                logger.warning(
+                    "Could not assign worker pid %s to the kill-on-close job; "
+                    "relying on the parent-death watchdog instead.",
+                    process.pid,
+                )
             worker = upstream.WorkerSession(
                 session_id=f"__worker_schema_{uuid.uuid4().hex[:8]}",
                 input_path="",
