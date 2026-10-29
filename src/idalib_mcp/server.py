@@ -65,6 +65,15 @@ def _json_bytes(payload: Any) -> bytes:
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
+def _decodes_as_json(text: str) -> bool:
+    """Return whether zeromcp's Optional[str] coercion would json.loads `text` into a non-string."""
+    try:
+        json.loads(text)
+    except ValueError:
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class OpenSubmission:
     """What submit_open did: attached to a registered or pending database, or created an open job."""
@@ -256,7 +265,11 @@ def _build_managed_supervisor_class(upstream):
 
                 if session_id is None:
                     session_id = str(uuid.uuid4())[:8]
-                    while session_id in self.sessions or session_id in self._pending:
+                    while (
+                        session_id in self.sessions
+                        or session_id in self._pending
+                        or _decodes_as_json(session_id)
+                    ):
                         session_id = str(uuid.uuid4())[:8]
                 elif session_id in self.sessions or session_id in self._pending:
                     raise ValueError(f"Session already exists: {session_id}")
@@ -1349,6 +1362,9 @@ def _build_request_handler(upstream):
                 self._send_json(status, payload)
                 return
             failure = json.loads(render_job_failed(job.info())["content"][0]["text"])["error"]
+            if save and job.status == "error":
+                self._send_json(500, {"success": False, "saved": False, "error": f"Save failed: {failure}"})
+                return
             self._send_json(500, {"success": False, "error": failure})
 
         def _supervisor(self):
@@ -2060,6 +2076,8 @@ class _ToolsCallRoute:
         if self.meta is not None:
             params["_meta"] = self.meta
         forwarded = {**self.request_obj, "params": params}
+        if self.notification:
+            forwarded["id"] = None
         holder: list[Any] = []
 
         def body(_job: Job) -> Any:

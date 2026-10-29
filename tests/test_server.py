@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -1434,6 +1435,44 @@ class RouterTests(unittest.TestCase):
         recent = lambda: supervisor.job_databases(session.session_id, 5)[0]["recent"]
         self.assertTrue(_wait_until(lambda: [(j["tool"], j["status"]) for j in recent()][:1] == [("slow_tool", "ok")]))
 
+    def test_generated_session_id_never_decodes_as_json(self) -> None:
+        supervisor, factory = self._installed(sync_wait=_WAIT)
+        queued = [
+            uuid.UUID("66547093-0000-4000-8000-000000000000"),
+            uuid.UUID("abcdef12-0000-4000-8000-000000000000"),
+        ]
+        stub = mock.Mock(uuid4=lambda: queued.pop(0) if queued else uuid.uuid4())
+
+        with mock.patch("idalib_mcp.server.uuid", stub):
+            session, _worker = self._open(supervisor, factory, "a.exe")
+
+        self.assertNotEqual(session.session_id, "66547093")
+        saved = self._call("idalib_save", {"session_id": session.session_id})
+        self.assertIs(saved["result"]["isError"], False, saved)
+
+    def test_tools_call_notification_job_ok_on_zeromcp_worker(self) -> None:
+        supervisor, factory = self._installed(sync_wait=_WAIT)
+        session, _worker = self._open(supervisor, factory, "a.exe")
+        calls: list[int] = []
+
+        def echo(x: int) -> dict:
+            """Record the call."""
+            calls.append(x)
+            return {"x": x}
+
+        real = type(self.upstream.mcp)("real-worker")
+        real.tool(echo)
+        real.serve("127.0.0.1", 0, background=True)
+        self.addCleanup(real.stop)
+        session.port = real._http_server.server_address[1]
+        params = {"name": "echo", "arguments": {"x": 2}}
+
+        self.assertIsNone(self._dispatch({"jsonrpc": "2.0", "method": "tools/call", "params": params}))
+
+        recent = lambda: supervisor.job_databases(session.session_id, 5)[0]["recent"]
+        self.assertTrue(_wait_until(lambda: [(j["tool"], j["status"]) for j in recent()][:1] == [("echo", "ok")]))
+        self.assertEqual(calls, [2])
+
     def test_analysis_call_auto_opens_existing_database_path(self) -> None:
         supervisor, factory = self._installed(sync_wait=_WAIT)
         path = self._path("sample.exe")
@@ -1556,6 +1595,17 @@ class WebUiTests(unittest.TestCase):
         self.assertNotIn(session.session_id, supervisor.sessions)
         stored = close.result()["result"]["structuredContent"]
         self.assertEqual((stored["success"], stored["saved"]), (True, False))
+
+    def test_ui_close_save_failure_before_body_keeps_save_failed_shape(self) -> None:
+        supervisor, _factory = self._installed(sync_wait=_WAIT)
+        session = supervisor.open_session(self._path("a.exe"), context_id=self.ctx)
+        port = self._serve()
+
+        with mock.patch.object(supervisor, "_ensure_ready", side_effect=RuntimeError("reopen failed")):
+            status, body = self._http(port, "POST", f"/api/instances/{session.session_id}/close", {"save": True})
+
+        self.assertEqual(status, 500)
+        self.assertEqual(body, {"success": False, "saved": False, "error": "Save failed: reopen failed"})
 
 
 class OpenUiToolTests(unittest.TestCase):
