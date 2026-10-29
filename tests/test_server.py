@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import importlib
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from typing import Any
 
+from fakeworker import FakeWorker, FakeWorkerFactory, make_supervisor, preserved_upstream
+from idalib_mcp.dispatcher import WorkerDispatcher
 from idalib_mcp.server import (
     _bound_instance_ui_url,
     _enable_path_database_auto_open,
@@ -231,118 +235,6 @@ class SupervisorDispatcherIntegrationTests(unittest.TestCase):
         supervisor = cls(FakeMcp(), worker_args=[])
         return supervisor
 
-    def test_get_or_create_dispatcher_returns_same_instance(self) -> None:
-        supervisor = self._build_supervisor()
-        d1 = supervisor.get_or_create_dispatcher("session-a")
-        d2 = supervisor.get_or_create_dispatcher("session-a")
-        self.assertIs(d1, d2)
-
-    def test_close_session_drops_dispatcher(self) -> None:
-        supervisor = self._build_supervisor()
-        supervisor.get_or_create_dispatcher("session-a")
-        # close_session calls super().close_session which uses sessions dict;
-        # FakeUpstream has no session 'session-a', so close returns False.
-        supervisor.close_session("session-a")
-        # The override must still drop the dispatcher entry.
-        self.assertNotIn("session-a", supervisor._dispatchers)
-
-    def test_call_worker_rpc_with_cancel_aborts_on_event(self) -> None:
-        import http.server, socketserver, threading as th, time
-
-        supervisor = self._build_supervisor()
-
-        # Spin up a tiny HTTP server that sleeps so we can cancel it mid-call.
-        class SlowHandler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self):
-                import time as _t
-                _t.sleep(2.0)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"jsonrpc":"2.0","result":{},"id":1}')
-
-            def log_message(self, *args, **kwargs):
-                pass
-
-        class QuietTCPServer(socketserver.TCPServer):
-            def handle_error(self, request, client_address):
-                pass
-
-        srv = QuietTCPServer(("127.0.0.1", 0), SlowHandler)
-        port = srv.server_address[1]
-        srv_thread = th.Thread(target=srv.serve_forever, daemon=True)
-        srv_thread.start()
-
-        class FakeWorker:
-            host = "127.0.0.1"
-
-        worker = FakeWorker()
-        worker.port = port
-
-        cancel = th.Event()
-        th.Timer(0.2, cancel.set).start()
-
-        from idalib_mcp.dispatcher import CancelledError
-        try:
-            t0 = time.monotonic()
-            with self.assertRaises(CancelledError):
-                supervisor._call_worker_rpc_with_cancel(
-                    worker,
-                    {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                     "params": {"name": "noop", "arguments": {}}},
-                    cancel,
-                )
-            elapsed = time.monotonic() - t0
-            self.assertLess(elapsed, 1.5, "should abort well before the 2s server sleep")
-        finally:
-            srv.shutdown()
-            srv.server_close()
-
-
-    def test_forward_raw_routes_tools_call_through_dispatcher(self) -> None:
-        supervisor = self._build_supervisor()
-
-        session = FakeSession()
-        session.session_id = "session-a"
-
-        captured: list[dict] = []
-
-        def fake_rpc(worker, request_obj, cancel_event):
-            captured.append(request_obj)
-            return {"jsonrpc": "2.0", "id": request_obj.get("id"),
-                    "result": {"content": [], "isError": False, "structuredContent": {"ok": True}}}
-
-        supervisor._call_worker_rpc_with_cancel = fake_rpc
-
-        response = supervisor.forward_raw(session, {
-            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
-            "params": {"name": "decompile", "arguments": {"addr": "0x1000"}},
-        })
-
-        self.assertEqual(response["id"], 7)
-        self.assertFalse(response["result"]["isError"])
-        snapshot = supervisor.get_or_create_dispatcher("session-a").snapshot()
-        self.assertEqual(len(snapshot["history"]), 1)
-        self.assertEqual(snapshot["history"][0]["tool"], "decompile")
-
-    def test_forward_raw_bypasses_dispatcher_for_non_tools_call(self) -> None:
-        supervisor = self._build_supervisor()
-        session = FakeSession()
-        session.session_id = "session-a"
-
-        # Replace the base _worker_rpc to confirm bypass.
-        def base_rpc(worker, request_obj, *, timeout=None):
-            return {"jsonrpc": "2.0", "id": request_obj.get("id"), "result": {"ok": True}}
-
-        supervisor._worker_rpc = base_rpc  # type: ignore[assignment]
-
-        response = supervisor.forward_raw(session, {
-            "jsonrpc": "2.0", "id": 9, "method": "resources/list", "params": {},
-        })
-        self.assertEqual(response["result"], {"ok": True})
-        # Dispatcher should not have been created for resources/list.
-        self.assertNotIn("session-a", supervisor._dispatchers)
-
     def test_error_response_is_decorated_with_tool_schema(self) -> None:
         supervisor = self._build_supervisor()
 
@@ -367,6 +259,233 @@ class SupervisorDispatcherIntegrationTests(unittest.TestCase):
         self.assertEqual(meta.get("tool_schema", {}).get("required"), ["addr"])
         texts = [c.get("text", "") for c in decorated["result"]["content"]]
         self.assertTrue(any("Tool schema" in t for t in texts))
+
+
+_WAIT = 5.0
+
+
+def _wait_until(predicate: Any, timeout: float = _WAIT) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
+
+
+class SupervisorQueueCoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.temp_path = Path(temp_dir.name)
+        self.upstream = importlib.import_module("ida_pro_mcp.idalib_supervisor")
+        self.factory = FakeWorkerFactory(self.upstream)
+        self.supervisor = make_supervisor(self, self.upstream, self.factory, sync_wait=0.1)
+        wait_ready = self.supervisor._wait_worker_ready
+        # Upstream retries for 120 s; a misrouted ready ping must fail the test, not stall the suite.
+        self.supervisor._wait_worker_ready = lambda worker, timeout=_WAIT: wait_ready(worker, timeout=_WAIT)
+
+    def _open(self, name: str) -> Any:
+        path = self.temp_path / name
+        path.write_bytes(b"MZ")
+        return self.supervisor.open_session(str(path), context_id=self.upstream.SHARED_FALLBACK_CONTEXT_ID)
+
+    def _worker_of(self, session: Any) -> FakeWorker:
+        return next(worker for worker in self.factory.workers if worker.port == session.port)
+
+    def _tool_body(self, name: str, arguments: dict[str, Any]) -> Any:
+        supervisor = self.supervisor
+
+        def body(_job: Any) -> Any:
+            return supervisor.call_worker_tool(supervisor.resolve_session(), name, arguments)
+
+        return body
+
+    def _submit_slow(self, session: Any, seconds: float) -> Any:
+        arguments = {"seconds": seconds}
+        job = self.supervisor.submit_job(
+            session.session_id, "slow_tool", 1, arguments, self._tool_body("slow_tool", arguments)
+        )
+        self.assertTrue(_wait_until(lambda: "slow_tool" in self._worker_of(session).call_names()))
+        return job
+
+    def _queued(self, dispatcher: WorkerDispatcher) -> list[tuple[str, str]]:
+        return [(job["tool"], job["kind"]) for job in dispatcher.jobs_info()["queued"]]
+
+    def _call(self, worker: FakeWorker, name: str) -> Any:
+        return next(call for call in worker.calls() if (call.name or call.method) == name)
+
+    def test_resources_read_waits_behind_slow_tool(self) -> None:
+        session = self._open("a.exe")
+        worker = self._worker_of(session)
+        dispatcher = self.supervisor._dispatchers[session.session_id]
+        request = {"jsonrpc": "2.0", "id": 5, "method": "resources/read", "params": {"uri": "ida://fake"}}
+        responses: list[Any] = []
+        with preserved_upstream(self.upstream):
+            self.upstream.supervisor = self.supervisor
+            slow = self._submit_slow(session, 0.8)
+            reader = threading.Thread(
+                target=lambda: responses.append(self.upstream._handle_resources_read(request)), daemon=True
+            )
+            reader.start()
+            self.assertTrue(_wait_until(lambda: self._queued(dispatcher) == [("resources/read", "rpc")]))
+            self.assertFalse(slow.is_done())
+            self.assertNotIn("resources/read", worker.call_names())
+            reader.join(_WAIT)
+            self.assertFalse(reader.is_alive())
+
+            contents = [{"uri": "ida://fake", "mimeType": "application/json", "text": "{}"}]
+            self.assertEqual(responses, [{"jsonrpc": "2.0", "result": {"contents": contents}, "id": 5}])
+            self.assertEqual(slow.status, "ok")
+            read_call = self._call(worker, "resources/read")
+            self.assertGreaterEqual(read_call.start, self._call(worker, "slow_tool").end)
+
+    def test_cancelled_queued_job_never_reaches_worker(self) -> None:
+        session = self._open("a.exe")
+        worker = self._worker_of(session)
+        sid = session.session_id
+        slow = self._submit_slow(session, 0.5)
+        doomed_args = {"which": "doomed"}
+        after_args = {"which": "after"}
+        doomed = self.supervisor.submit_job(sid, "echo", 2, doomed_args, self._tool_body("echo", doomed_args))
+        after = self.supervisor.submit_job(sid, "echo", 3, after_args, self._tool_body("echo", after_args))
+
+        self.assertEqual(self.supervisor.cancel_job(doomed.id), "removed")
+        self.assertTrue(after.wait(_WAIT))
+
+        self.assertEqual((slow.status, doomed.status, after.status), ("ok", "cancelled", "ok"))
+        self.assertEqual([call.arguments for call in worker.calls() if call.name == "echo"], [after_args])
+        self.assertEqual(self.supervisor.cancel_job(doomed.id), "finished")
+        self.assertEqual(self.supervisor.cancel_job("no-such-job"), "unknown")
+        self.assertEqual(self.supervisor.cancel_job(7), "unknown")
+
+    def test_cross_database_worker_rpc_raises(self) -> None:
+        a = self._open("a.exe")
+        b = self._open("b.exe")
+        b_worker = self._worker_of(b)
+        supervisor = self.supervisor
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": "echo", "arguments": {"from": "a"}},
+        }
+
+        def body(_job: Any) -> Any:
+            return supervisor._worker_rpc(supervisor.sessions[b.session_id], payload)
+
+        with self.assertLogs("idalib_mcp.dispatcher", level="ERROR"):
+            job = supervisor.submit_job(a.session_id, "cross", None, {}, body)
+            self.assertTrue(job.wait(_WAIT))
+
+        self.assertEqual(job.status, "error")
+        self.assertIsInstance(job.exception(), RuntimeError)
+        self.assertEqual(str(job.exception()), "Cross-database worker RPC from a job body")
+        self.assertNotIn("echo", b_worker.call_names())
+        self.assertEqual(supervisor._dispatchers[b.session_id].jobs_info()["recent"], [])
+
+    def test_unregister_unknown_id_keeps_pending_dispatcher(self) -> None:
+        pending = WorkerDispatcher("pending-id")
+        self.supervisor._dispatchers["pending-id"] = pending
+
+        with self.supervisor._lock:
+            result = self.supervisor._unregister_session_locked("pending-id")
+
+        self.assertIsNone(result)
+        self.assertIs(self.supervisor._dispatchers["pending-id"], pending)
+        self.assertFalse(pending.closed)
+        self.assertEqual(self.supervisor.database_state("pending-id"), "closed")
+
+    def test_worker_rpc_from_transport_thread_queues_as_rpc_job(self) -> None:
+        session = self._open("a.exe")
+        worker = self._worker_of(session)
+        dispatcher = self.supervisor._dispatchers[session.session_id]
+        slow = self._submit_slow(session, 0.8)
+        request = {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {"name": "echo", "arguments": {"addr": "0x1000"}},
+        }
+        responses: list[Any] = []
+        caller = threading.Thread(
+            target=lambda: responses.append(self.supervisor.forward_raw(session, request)), daemon=True
+        )
+        caller.start()
+
+        self.assertTrue(_wait_until(lambda: self._queued(dispatcher) == [("echo", "rpc")]))
+        self.assertEqual(list(self.supervisor._dispatchers), [session.session_id])
+        self.assertIs(self.supervisor._dispatchers[session.session_id], dispatcher)
+        caller.join(_WAIT)
+        self.assertFalse(caller.is_alive())
+
+        self.assertEqual(responses[0]["id"], 7)
+        echoed = {"tool": "echo", "arguments": {"addr": "0x1000"}}
+        self.assertEqual(responses[0]["result"]["structuredContent"], echoed)
+        self.assertEqual(slow.status, "ok")
+        self.assertEqual(
+            [(j["tool"], j["kind"], j["status"]) for j in dispatcher.jobs_info(recent=2)["recent"]],
+            [("echo", "rpc", "ok"), ("slow_tool", "tool", "ok")],
+        )
+        self.assertGreaterEqual(self._call(worker, "echo").start, self._call(worker, "slow_tool").end)
+
+    def test_worker_rpc_to_unregistered_worker_goes_direct(self) -> None:
+        session = self._open("a.exe")
+        dispatcher = self.supervisor._dispatchers[session.session_id]
+        slow = self._submit_slow(session, 1.0)
+        spare = self.supervisor._spawn_worker()
+        spare_worker = self._worker_of(spare)
+        supervisor = self.supervisor
+
+        response = supervisor._worker_rpc(spare, {"jsonrpc": "2.0", "id": 3, "method": "ping"}, timeout=2.0)
+
+        self.assertFalse(slow.is_done())
+        self.assertEqual(response, {"jsonrpc": "2.0", "result": {}, "id": 3})
+        self.assertEqual(list(supervisor._dispatchers), [session.session_id])
+        self.assertEqual(dispatcher.jobs_info()["queued"], [])
+
+        job = supervisor.submit_job(
+            session.session_id,
+            "spare_ping",
+            None,
+            {},
+            lambda _job: supervisor._worker_rpc(spare, {"jsonrpc": "2.0", "id": 4, "method": "ping"}),
+        )
+        self.assertTrue(job.wait(_WAIT))
+        self.assertEqual(job.status, "ok")
+        self.assertEqual(spare_worker.call_names(), ["ping", "ping", "ping"])
+        self.assertEqual(list(supervisor._dispatchers), [session.session_id])
+
+    def test_close_session_retires_dispatcher(self) -> None:
+        session = self._open("a.exe")
+        sid = session.session_id
+        worker = self._worker_of(session)
+        dispatcher = self.supervisor._dispatchers[sid]
+        earlier = self.supervisor.submit_job(sid, "echo", 1, {}, self._tool_body("echo", {}))
+        self.assertTrue(earlier.wait(_WAIT))
+
+        self.assertTrue(self.supervisor.close_session(sid))
+
+        self.assertNotIn(sid, self.supervisor._dispatchers)
+        self.assertNotIn(sid, self.supervisor.sessions)
+        self.assertTrue(dispatcher.closed)
+        self.assertEqual(dispatcher.close_reason, f"Session closed: {sid}")
+        self.assertIs(self.supervisor.find_job(earlier.id), earlier)
+        self.assertEqual(self.supervisor.database_state(sid), "closed")
+        databases = self.supervisor.job_databases(sid, 5)
+        self.assertEqual(
+            [(d["database"], d["filename"], d["state"]) for d in databases], [(sid, "a.exe", "closed")]
+        )
+        self.assertEqual(
+            [(j["tool"], j["kind"], j["status"]) for j in databases[0]["recent"]],
+            [("idalib_close", "close", "ok"), ("echo", "tool", "ok")],
+        )
+        self.assertEqual(worker.call_names()[-1], "idalib_close")
+        self.assertEqual(worker.process.poll(), -9)
+        with self.assertRaises(LookupError):
+            self.supervisor.submit_job(sid, "echo", 2, {}, self._tool_body("echo", {}))
+        self.assertFalse(self.supervisor.close_session(sid))
+        self.assertEqual(self.supervisor.list_sessions(None), [])
 
 
 class OpenUiToolTests(unittest.TestCase):
