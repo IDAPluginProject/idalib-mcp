@@ -19,6 +19,7 @@ class InstallerTests(unittest.TestCase):
             unsafe=True,
             isolated_contexts=True,
             max_workers=8,
+            sync_wait=2.5,
         )
 
         self.assertIn("command", config)
@@ -32,6 +33,12 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("--isolated-contexts", args)
         self.assertIn("--max-workers", args)
         self.assertIn("8", args)
+        self.assertEqual(args[args.index("--sync-wait") + 1], "2.5")
+
+    def test_stdio_config_omits_sync_wait_when_not_given(self) -> None:
+        config = generate_mcp_config(client_name="Generic", transport="stdio")
+
+        self.assertNotIn("--sync-wait", config["args"])
 
     def test_http_config_for_claude_uses_streamable_http_shape(self) -> None:
         config = generate_mcp_config(

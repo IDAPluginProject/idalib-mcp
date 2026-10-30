@@ -38,6 +38,71 @@ class CancellationRegistryTests(unittest.TestCase):
         self.assertTrue(h2.event.is_set())
 
 
+class CancelTombstoneTests(unittest.TestCase):
+    def test_cancel_before_register_pre_cancels_once(self) -> None:
+        registry = CancellationRegistry()
+        self.assertFalse(registry.cancel("req-1"))
+
+        first = registry.register("req-1")
+        self.assertTrue(first.event.is_set())
+        second = registry.register("req-1")
+        self.assertFalse(second.event.is_set())
+
+    def test_expired_tombstone_is_ignored(self) -> None:
+        registry = CancellationRegistry()
+        registry.TOMBSTONE_TTL = 0.05
+        self.assertFalse(registry.cancel("req-1"))
+        time.sleep(0.1)
+        self.assertFalse(registry.register("req-1").event.is_set())
+
+    def test_tombstone_cap_keeps_newest(self) -> None:
+        registry = CancellationRegistry()
+        registry.TOMBSTONE_CAP = 2
+        for request_id in (1, 2, 3):
+            self.assertFalse(registry.cancel(request_id))
+        self.assertFalse(registry.register(1).event.is_set())
+        self.assertTrue(registry.register(2).event.is_set())
+        self.assertTrue(registry.register(3).event.is_set())
+
+    def test_repeated_cancel_refreshes_tombstone_age(self) -> None:
+        registry = CancellationRegistry()
+        registry.TOMBSTONE_CAP = 2
+        for request_id in (1, 2, 1, 3):
+            registry.cancel(request_id)
+        self.assertTrue(registry.register(1).event.is_set())
+        self.assertFalse(registry.register(2).event.is_set())
+        self.assertTrue(registry.register(3).event.is_set())
+
+    def test_cancel_unhashable_id_returns_false(self) -> None:
+        registry = CancellationRegistry()
+        self.assertFalse(registry.cancel([1]))
+        self.assertEqual(registry.snapshot(), [])
+
+    def test_register_unhashable_id_raises_type_error(self) -> None:
+        registry = CancellationRegistry()
+        with self.assertRaises(TypeError):
+            registry.register([1])
+
+    def test_unregister_keeps_tombstone(self) -> None:
+        registry = CancellationRegistry()
+        registry.cancel("req-1")
+        registry.unregister("req-1")
+        self.assertTrue(registry.register("req-1").event.is_set())
+
+    def test_cancel_of_registered_id_leaves_no_tombstone(self) -> None:
+        registry = CancellationRegistry()
+        registry.register("req-1")
+        self.assertTrue(registry.cancel("req-1"))
+        registry.unregister("req-1")
+        self.assertFalse(registry.register("req-1").event.is_set())
+
+    def test_snapshot_lists_registered_ids_only(self) -> None:
+        registry = CancellationRegistry()
+        registry.cancel("tomb")
+        registry.register("live")
+        self.assertEqual(registry.snapshot(), ["live"])
+
+
 class SocketWatcherTests(unittest.TestCase):
     def test_watcher_sets_event_when_peer_closes(self) -> None:
         registry = CancellationRegistry()

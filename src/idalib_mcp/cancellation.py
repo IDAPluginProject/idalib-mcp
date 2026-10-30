@@ -3,6 +3,7 @@ from __future__ import annotations
 import select
 import socket
 import threading
+import time
 import weakref
 from dataclasses import dataclass, field
 from typing import Any
@@ -16,13 +17,28 @@ class CancelHandle:
 
 
 class CancellationRegistry:
+    TOMBSTONE_TTL = 2.0
+    TOMBSTONE_CAP = 256
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._handles: dict[Any, CancelHandle] = {}
+        self._tombstones: dict[Any, float] = {}
+
+    def _prune_tombstones(self, now: float) -> None:
+        """Drop expired tombstones; caller holds `_lock`. Entries are in age order."""
+        while self._tombstones:
+            oldest = next(iter(self._tombstones))
+            if now - self._tombstones[oldest] < self.TOMBSTONE_TTL:
+                break
+            del self._tombstones[oldest]
 
     def register(self, request_id: Any) -> CancelHandle:
         handle = CancelHandle(request_id=request_id)
         with self._lock:
+            self._prune_tombstones(time.monotonic())
+            if self._tombstones.pop(request_id, None) is not None:
+                handle.event.set()
             self._handles[request_id] = handle
         return handle
 
@@ -31,8 +47,18 @@ class CancellationRegistry:
             self._handles.pop(request_id, None)
 
     def cancel(self, request_id: Any) -> bool:
-        with self._lock:
-            handle = self._handles.get(request_id)
+        try:
+            with self._lock:
+                now = time.monotonic()
+                self._prune_tombstones(now)
+                handle = self._handles.get(request_id)
+                if handle is None:
+                    self._tombstones.pop(request_id, None)
+                    self._tombstones[request_id] = now
+                    while len(self._tombstones) > self.TOMBSTONE_CAP:
+                        del self._tombstones[next(iter(self._tombstones))]
+        except TypeError:
+            return False
         if handle is None:
             return False
         handle.event.set()
