@@ -96,6 +96,7 @@ def _stdio_args(
     unsafe: bool = False,
     isolated_contexts: bool = False,
     max_workers: int | None = None,
+    sync_wait: float | None = None,
     profile: str | Path | None = None,
 ) -> list[str]:
     args = ["-m", "idalib_mcp", "--stdio"]
@@ -107,6 +108,8 @@ def _stdio_args(
         args.append("--isolated-contexts")
     if max_workers is not None:
         args.extend(["--max-workers", str(max_workers)])
+    if sync_wait is not None:
+        args.extend(["--sync-wait", f"{sync_wait:.15g}"])
     if profile is not None:
         args.extend(["--profile", str(profile)])
     return args
@@ -122,6 +125,7 @@ def generate_mcp_config(
     unsafe: bool = False,
     isolated_contexts: bool = False,
     max_workers: int | None = None,
+    sync_wait: float | None = None,
     profile: str | Path | None = None,
 ) -> dict[str, Any]:
     if transport == "stdio":
@@ -130,6 +134,7 @@ def generate_mcp_config(
             unsafe=unsafe,
             isolated_contexts=isolated_contexts,
             max_workers=max_workers,
+            sync_wait=sync_wait,
             profile=profile,
         )
         if client_name == "Opencode":
@@ -161,6 +166,7 @@ def _args_kwargs(args) -> dict[str, Any]:
         "unsafe": args.unsafe,
         "isolated_contexts": args.isolated_contexts,
         "max_workers": args.max_workers,
+        "sync_wait": args.sync_wait,
         "profile": args.profile,
     }
 
